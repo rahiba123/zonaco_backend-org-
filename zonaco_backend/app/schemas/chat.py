@@ -22,6 +22,14 @@ class AskResponse(BaseModel):
     """Response returned from RAG generation or threshold fallback."""
     session_id: str = Field(..., description="Active session UUID")
     answer: str = Field(..., description="Generated answer or fallback explanation")
+    answer_source: str = Field(
+        default="faq",
+        description=(
+            "Where the answer came from: 'faq' (bank FAQ knowledge base), "
+            "'user_document' (the session's uploaded document), or "
+            "'general_llm' (model's own knowledge, used when neither source matched)"
+        )
+    )
     detected_category: Optional[str] = Field(
         default=None,
         description="Category of the best-matching FAQ chunk"

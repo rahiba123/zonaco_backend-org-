@@ -1,17 +1,181 @@
 """RAG service coordinating scoped vector retrieval, threshold evaluation, and OpenRouter LLM generation."""
 
 from dataclasses import dataclass, field
+import re
 import time
 from typing import List, Optional
 import httpx
 from app.config import get_settings
+from app.services.document_store import DocumentSearchResult, DocumentVectorStoreService, get_document_vector_store
 from app.services.vector_store import SearchResult, VectorStoreService, get_vector_store
 from app.utils.exceptions import LLMServiceException
 from app.utils.logger import logger, log_chat_interaction
 
-# Strict banking system prompt guardrail
+# ---------------------------------------------------------------------------
+# LLM filler-phrase & thinking-block stripping
+#
+# Free-tier and reasoning models often pollute answers with:
+#   (a) Filler openers: "Based on the context provided, ..."
+#   (b) Full thinking blocks: "Here's a thinking process:\n1. Analyze..."
+#       or <think>...</think> XML tags.
+#
+# We strip both layers so users always receive a clean, direct reply.
+# ---------------------------------------------------------------------------
+
+# --- (a) Filler opener patterns ---
+_FILLER_PATTERNS = [
+    r"^Based on the (?:context|FAQ context|document excerpts?|information|provided (?:context|information|excerpt))[,.]?\s*",
+    r"^According to (?:the (?:FAQ|context|document|provided context|excerpt)|our (?:FAQ|records))[,.]?\s*",
+    r"^From the (?:FAQ|context|document|provided (?:context|information))[,.]?\s*",
+    r"^Using the (?:FAQ|context|provided (?:context|information|excerpt))[,.]?\s*",
+    r"^As (?:per|stated in) the (?:FAQ|context|document|provided (?:context|information))[,.]?\s*",
+    r"^The (?:FAQ|context|document|provided information) (?:states?|indicates?|mentions?|says?) that\s*",
+    r"^(?:I can see that|Looking at the (?:context|document|FAQ),?)\s*",
+]
+_FILLER_RE = re.compile("|".join(_FILLER_PATTERNS), re.IGNORECASE)
+
+# --- (b) Thinking-block detection patterns ---
+# Matches the full thinking preamble that reasoning models output before the answer.
+_THINKING_BLOCK_PATTERNS = [
+    # <think>...</think> XML tags (some models use these)
+    re.compile(r"<think>.*?</think>\s*", re.DOTALL | re.IGNORECASE),
+    # "Here's a thinking process:" / "Here is my thinking:" preambles followed by numbered steps
+    re.compile(
+        r"^Here(?:'s| is)(?: a| my)? (?:thinking process|thought process|analysis|reasoning)[:\.].*?(?=\n\n|\Z)",
+        re.DOTALL | re.IGNORECASE,
+    ),
+    # "Let me think/analyze/break down/walk through this:" openers
+    re.compile(
+        r"^Let me (?:think|analyze|break (?:this )?down|walk (?:through )?this|consider|work through this)[:\.,]?\s*\n?",
+        re.IGNORECASE,
+    ),
+]
+
+# Detects whether the ENTIRE response looks like a reasoning dump
+# (numbered step headings like "1.  **Analyze User Input:**")
+_THINKING_STEP_RE = re.compile(
+    r"^\s*\d+\.\s+\*{0,2}(?:Analyze|Determine|Consider|Review|Evaluate|Think|Plan|Step|Understand)",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+# Regex that detects "Draft:", "Answer:", "Final Answer:", "Response:" markers
+# — the model writes reasoning then uses one of these to signal the actual answer.
+_DRAFT_MARKER_RE = re.compile(
+    r"(?:^|\n)\s*(?:Draft|Answer|Final Answer|Final Response|Response|My (?:Answer|Response))\s*:\s*",
+    re.IGNORECASE,
+)
+
+# Paragraph-level patterns that identify reasoning / meta-commentary lines.
+# If a paragraph matches ANY of these it is dropped from the final answer.
+_REASONING_PARA_PATTERNS = [
+    re.compile(r"^\d+\.\s+\*{0,2}(?:Analyze|Determine|Consider|Review|Evaluate|Plan|Step|Understand|Identify)", re.IGNORECASE),
+    re.compile(r"^(?:Here(?:'s| is)|Let(?:'s| me| us))", re.IGNORECASE),
+    re.compile(r"^I(?:'ll| will| need to| should| must| can| am going to)", re.IGNORECASE),
+    re.compile(r"^(?:Key point|Key info|Note:|Note that|Note -)", re.IGNORECASE),
+    re.compile(r"^(?:All|The) (?:document|context|FAQ|excerpt)s? (?:consistently |always |clearly )?(?:say|state|indicate|mention|show)", re.IGNORECASE),
+    re.compile(r"^(?:Let'?s? (?:craft|structure|write|draft|build|form|create|compose|think about|consider) the (?:answer|response|reply))", re.IGNORECASE),
+    re.compile(r"^(?:Draft|Planning|Outline|Summary of context|Key points across)", re.IGNORECASE),
+    re.compile(r"^(?:- User query:|- Selected Category:|- I need to)", re.IGNORECASE),
+    re.compile(r"^(?:Okay|Alright|Sure|Right),?\s+(?:so\s+)?(?:let|I|the)", re.IGNORECASE),
+]
+
+
+def _is_reasoning_paragraph(para: str) -> bool:
+    """Return True if the paragraph looks like internal reasoning, not a customer answer."""
+    for pat in _REASONING_PARA_PATTERNS:
+        if pat.match(para):
+            return True
+    return False
+
+
+def _extract_answer_from_thinking_block(text: str) -> str:
+    """Pull the customer-facing answer out of a thinking dump.
+
+    Strategy (in priority order):
+    1. If model used a 'Draft:' / 'Answer:' marker, take everything after it.
+    2. Otherwise filter paragraphs by removing all reasoning-looking ones.
+    3. Fallback: return the last paragraph.
+    """
+    # Strategy 1 — explicit answer marker
+    marker_match = _DRAFT_MARKER_RE.search(text)
+    if marker_match:
+        after_marker = text[marker_match.end():].strip()
+        if after_marker:
+            return after_marker
+
+    # Strategy 2 — paragraph filtering
+    paragraphs = [p.strip() for p in re.split(r"\n{2,}", text) if p.strip()]
+    if not paragraphs:
+        return text
+
+    answer_paragraphs = [
+        p for p in paragraphs
+        if not _is_reasoning_paragraph(p)
+        and not _THINKING_STEP_RE.match(p)
+        and len(p) > 40  # skip very short transition fragments
+    ]
+
+    if answer_paragraphs:
+        return "\n\n".join(answer_paragraphs)
+
+    # Strategy 3 — fallback: last paragraph
+    return paragraphs[-1]
+
+
+def _strip_thinking_block(text: str) -> str:
+    """Remove thinking/reasoning blocks that LLMs output before the real answer."""
+    result = text.strip()
+
+    # Step 1 — strip <think>...</think> XML tags
+    for pattern in _THINKING_BLOCK_PATTERNS[:1]:
+        result = pattern.sub("", result).strip()
+
+    # Step 2 — check if response looks like a thinking dump and extract answer
+    is_thinking_dump = (
+        _THINKING_STEP_RE.search(result) is not None
+        or _DRAFT_MARKER_RE.search(result) is not None
+        or bool(re.match(r"^Here(?:'s| is)(?: a| my)? (?:thinking|thought|analysis|reasoning)", result, re.IGNORECASE))
+        or bool(re.match(r"^All (?:document|context|FAQ)s? (?:consistently )?(?:say|state|indicate)", result, re.IGNORECASE))
+        or bool(re.match(r"^Let'?s? (?:craft|structure|write|draft|think about)", result, re.IGNORECASE))
+        or bool(re.search(r"\nDraft\s*:", result, re.IGNORECASE))
+    )
+
+    if is_thinking_dump:
+        result = _extract_answer_from_thinking_block(result)
+
+    return result.strip()
+
+
+def _strip_llm_filler(text: str) -> str:
+    """Remove thinking blocks and filler openers from an LLM response.
+
+    Applied after every LLM call so users always receive a direct, clean answer.
+    Pass 1: Remove thinking/reasoning blocks (reasoning model leakage).
+    Pass 2: Remove filler opener phrases (up to 3 iterations).
+    """
+    # Pass 1 — thinking block removal
+    cleaned = _strip_thinking_block(text)
+
+    # Pass 2 — filler opener removal (up to 3 stacked openers)
+    for _ in range(3):
+        new = _FILLER_RE.sub("", cleaned, count=1).strip()
+        if new == cleaned:
+            break
+        if new:
+            new = new[0].upper() + new[1:]
+        cleaned = new
+
+    return cleaned
+
+
+
+
+# Strict banking system prompt guardrail (used for FAQ-grounded answers)
 BANKING_SYSTEM_PROMPT = """You are the official AI Customer Support Assistant for Zambia National Commercial Bank (Zanaco).
 Your primary duty is to provide helpful, accurate, and professional answers to customer inquiries based ONLY on the provided FAQ context below.
+
+CRITICAL OUTPUT RULE: Output ONLY the final customer-facing answer. Do NOT include any thinking process, reasoning steps, numbered analysis, internal deliberation, self-reflection, or meta-commentary. Do NOT write things like "Here's a thinking process", "Let me analyze", "Step 1:", "Analyze User Input:", or any similar internal reasoning. Start your response directly with the answer.
 
 STRICT GUIDELINES:
 1. Grounding: Answer the user's question ONLY using the factual information given in the FAQ Context.
@@ -22,6 +186,35 @@ STRICT GUIDELINES:
 6. Brevity: Be concise and directly address the customer's question. Use bullet points where appropriate for step-by-step instructions.
 """
 
+# Used when answering from a document the user uploaded in this session.
+DOCUMENT_SYSTEM_PROMPT = """You are a helpful assistant answering questions about a document the customer uploaded
+during this chat session, on behalf of Zambia National Commercial Bank (Zanaco).
+
+CRITICAL OUTPUT RULE: Output ONLY the final customer-facing answer. Do NOT include any thinking process, reasoning steps, numbered analysis, internal deliberation, self-reflection, or meta-commentary. Do NOT write things like "Here's a thinking process", "Let me analyze", "Step 1:", or any similar internal reasoning. Start your response directly with the answer.
+
+STRICT GUIDELINES:
+1. Grounding: Answer ONLY using the information in the provided document excerpts below.
+2. No Hallucinations: NEVER invent information that isn't in the document excerpts.
+3. Tone: Professional, courteous, and clear.
+4. Attribution: Make it clear the answer comes from the document the customer uploaded, not from Zanaco's official FAQ.
+5. Incomplete Coverage: If the excerpts don't fully answer the question, say so plainly rather than guessing.
+"""
+
+# Used only when GENERAL_LLM_FALLBACK_ENABLED=True and neither the document nor the FAQ matched.
+GENERAL_KNOWLEDGE_SYSTEM_PROMPT = """You are a helpful general-purpose assistant chatting on Zanaco's support channel.
+The customer's question did not match Zanaco's official FAQ knowledge base or their uploaded document.
+
+CRITICAL OUTPUT RULE: Output ONLY the final customer-facing answer. Do NOT include any thinking process, reasoning steps, numbered analysis, internal deliberation, or meta-commentary. Do NOT write things like "Here's a thinking process", "Let me analyze", "Step 1:", or any similar internal reasoning. Start your response directly with the answer.
+
+STRICT GUIDELINES:
+1. Answer using your own general knowledge, as helpfully and accurately as you can.
+2. Clearly state up front that this answer is NOT official Zanaco information and should be verified with the bank directly.
+3. NEVER state specific Zanaco fees, rates, account terms, or policies as fact — you don't have grounded data on those.
+   If asked about Zanaco-specific details, say you don't have official confirmation and suggest contacting the bank.
+4. Tone: Professional, courteous, and clear.
+"""
+
+
 
 @dataclass
 class RAGResponse:
@@ -31,15 +224,21 @@ class RAGResponse:
     links: List[str]
     confidence_score: float
     should_offer_escalation: bool
+    answer_source: str = "faq"  # "faq" | "user_document" | "general_llm"
     retrieved_sources: List[SearchResult] = field(default_factory=list)
 
 
 class RAGService:
     """Coordinates retrieval from ChromaDB, confidence threshold gating, and OpenRouter generation."""
 
-    def __init__(self, vector_store: Optional[VectorStoreService] = None):
+    def __init__(
+        self,
+        vector_store: Optional[VectorStoreService] = None,
+        document_vector_store: Optional[DocumentVectorStoreService] = None,
+    ):
         self.settings = get_settings()
         self.vector_store = vector_store or get_vector_store()
+        self.document_vector_store = document_vector_store or get_document_vector_store()
 
     async def answer_question(
         self,
@@ -47,7 +246,96 @@ class RAGService:
         question: str,
         category: Optional[str] = None
     ) -> RAGResponse:
-        """Execute full RAG workflow: retrieval -> confidence check -> LLM call."""
+        """Execute full routing workflow:
+
+        1. If this session has an uploaded document AND the question is a good match for it,
+           answer strictly from that document.
+        2. Otherwise, fall back to the existing FAQ knowledge-base pipeline.
+        3. If FAQ also doesn't match and GENERAL_LLM_FALLBACK_ENABLED is on, answer from the
+           LLM's general knowledge (clearly labeled unofficial). Otherwise offer live-agent escalation.
+        """
+        doc_was_checked = False
+
+        # Step 0: Try the session's uploaded document first, if one exists.
+        if self.document_vector_store.has_documents(session_id):
+            doc_response = await self._try_answer_from_document(session_id, question)
+            if doc_response is not None:
+                return doc_response
+            # Document was checked but didn't match — remember this for the fallback message.
+            doc_was_checked = True
+
+        return await self._answer_from_faq(session_id, question, category, doc_was_checked=doc_was_checked)
+
+
+    async def _try_answer_from_document(self, session_id: str, question: str) -> Optional[RAGResponse]:
+        """Attempt to answer from the session's uploaded document. Returns None if not a confident match."""
+        start_time = time.perf_counter()
+        doc_results: List[DocumentSearchResult] = self.document_vector_store.query(
+            session_id=session_id,
+            query_text=question,
+            n_results=self.settings.USER_DOC_TOP_K
+        )
+
+        top_doc = doc_results[0] if doc_results else None
+        top_score = top_doc.similarity_score if top_doc else 0.0
+
+        if not top_doc or top_score < self.settings.USER_DOC_SIMILARITY_THRESHOLD:
+            logger.info(
+                f"Session {session_id}: uploaded document top score {top_score:.3f} below "
+                f"threshold {self.settings.USER_DOC_SIMILARITY_THRESHOLD}; falling back to FAQ."
+            )
+            return None
+
+        context_blocks = []
+        for idx, res in enumerate(doc_results, 1):
+            context_blocks.append(f"[Excerpt {idx} from '{res.source_filename}']\n{res.text}")
+        context_str = "\n\n".join(context_blocks)
+
+        user_prompt = (
+            f"Customer Question: {question}\n\n"
+            f"--- Document Excerpts ---\n"
+            f"{context_str}\n"
+            f"--- End of Document Excerpts ---\n\n"
+            f"Answer the customer's question using only the excerpts above."
+        )
+
+        generated_answer = await self._call_openrouter(user_prompt, system_prompt=DOCUMENT_SYSTEM_PROMPT)
+
+        latency_ms = (time.perf_counter() - start_time) * 1000
+        log_chat_interaction(
+            session_id=session_id,
+            question=question,
+            category=None,
+            confidence_score=top_score,
+            matched_intent=None,
+            should_offer_escalation=False,
+            latency_ms=latency_ms
+        )
+
+        return RAGResponse(
+            answer=generated_answer,
+            matched_faq_intent=None,
+            links=[],
+            confidence_score=top_score,
+            should_offer_escalation=False,
+            answer_source="user_document",
+            retrieved_sources=[]
+        )
+
+    async def _answer_from_faq(
+        self,
+        session_id: str,
+        question: str,
+        category: Optional[str] = None,
+        doc_was_checked: bool = False
+    ) -> RAGResponse:
+        """Original FAQ-grounded RAG pipeline, with optional general-LLM fallback.
+
+        Args:
+            doc_was_checked: True when an uploaded document was queried but scored below
+                             threshold, so the fallback message can tell the user both
+                             sources were checked.
+        """
         start_time = time.perf_counter()
 
         # Step 1: Scoped Vector Retrieval
@@ -71,10 +359,43 @@ class RAGService:
         # Step 2: Confidence Threshold Evaluation
         if top_score < self.settings.SIMILARITY_THRESHOLD or not top_match:
             latency_ms = (time.perf_counter() - start_time) * 1000
-            fallback_answer = (
-                "I'm sorry, I couldn't find an exact answer to your inquiry in our official FAQ knowledge base. "
-                "Would you like to connect with a Zanaco customer support agent for further assistance?"
-            )
+
+            if self.settings.GENERAL_LLM_FALLBACK_ENABLED:
+                general_answer = await self._call_openrouter(
+                    f"Customer Question: {question}",
+                    system_prompt=GENERAL_KNOWLEDGE_SYSTEM_PROMPT
+                )
+                log_chat_interaction(
+                    session_id=session_id,
+                    question=question,
+                    category=category,
+                    confidence_score=top_score,
+                    matched_intent=top_intent,
+                    should_offer_escalation=False,
+                    latency_ms=latency_ms
+                )
+                return RAGResponse(
+                    answer=general_answer,
+                    matched_faq_intent=top_intent,
+                    links=collected_links,
+                    confidence_score=top_score,
+                    should_offer_escalation=False,
+                    answer_source="general_llm",
+                    retrieved_sources=search_results
+                )
+
+            # Build a context-aware fallback message
+            if doc_was_checked:
+                fallback_answer = (
+                    "I checked both your uploaded document and our official FAQ knowledge base, "
+                    "but I couldn't find a relevant answer to your question in either source. "
+                    "Would you like to connect with a Zanaco customer support agent who can assist you further?"
+                )
+            else:
+                fallback_answer = (
+                    "I'm sorry, I couldn't find an exact answer to your inquiry in our official FAQ knowledge base. "
+                    "Would you like to connect with a Zanaco customer support agent for further assistance?"
+                )
             log_chat_interaction(
                 session_id=session_id,
                 question=question,
@@ -90,8 +411,11 @@ class RAGService:
                 links=collected_links,
                 confidence_score=top_score,
                 should_offer_escalation=True,
+                answer_source="faq",
                 retrieved_sources=search_results
             )
+
+
 
         # Step 3: Construct Context from Retrieved Documents
         context_blocks = []
@@ -117,7 +441,7 @@ class RAGService:
         )
 
         # Step 4: Call OpenRouter LLM
-        generated_answer = await self._call_openrouter(user_prompt)
+        generated_answer = await self._call_openrouter(user_prompt, system_prompt=BANKING_SYSTEM_PROMPT)
 
         latency_ms = (time.perf_counter() - start_time) * 1000
         log_chat_interaction(
@@ -136,10 +460,11 @@ class RAGService:
             links=collected_links,
             confidence_score=top_score,
             should_offer_escalation=False,
+            answer_source="faq",
             retrieved_sources=search_results
         )
 
-    async def _call_openrouter(self, user_content: str) -> str:
+    async def _call_openrouter(self, user_content: str, system_prompt: str = BANKING_SYSTEM_PROMPT) -> str:
         """Execute async HTTP POST request to OpenRouter chat completions with candidate fallbacks."""
         api_key = self.settings.OPENROUTER_API_KEY
         if not api_key:
@@ -174,7 +499,7 @@ class RAGService:
                 payload = {
                     "model": model_id,
                     "messages": [
-                        {"role": "system", "content": BANKING_SYSTEM_PROMPT},
+                        {"role": "system", "content": system_prompt},
                         {"role": "user", "content": user_content}
                     ],
                     "temperature": 0.2,
@@ -189,7 +514,7 @@ class RAGService:
                         choices = data.get("choices", [])
                         if choices and "message" in choices[0]:
                             answer_text = choices[0]["message"].get("content", "").strip()
-                            return answer_text
+                            return _strip_llm_filler(answer_text)
 
                     logger.warning(
                         f"OpenRouter model '{model_id}' failed with status {response.status_code}: {response.text}"

@@ -4,6 +4,7 @@ import uuid
 from fastapi import APIRouter, Depends, Request
 from app.config import Settings, get_settings
 from app.dependencies import (
+    get_document_vector_store_dep,
     get_limiter,
     get_rag_service_dep,
     get_session_store_dep,
@@ -21,6 +22,7 @@ from app.schemas.chat import (
     SatisfactionResponse,
 )
 from app.services.rag import RAGService
+from app.services.document_store import DocumentVectorStoreService
 from app.services.session_store import SessionStore
 from app.state_machine import SessionState, StateMachine
 from app.utils.logger import logger
@@ -107,6 +109,7 @@ async def ask_question(
     return AskResponse(
         session_id=session_id,
         answer=rag_result.answer,
+        answer_source=rag_result.answer_source,
         detected_category=detected_category,
         matched_faq_intent=rag_result.matched_faq_intent,
         links=rag_result.links,
@@ -269,7 +272,8 @@ async def escalate_to_agent(
 )
 async def rate_conversation(
     payload: RateRequest,
-    session_store: SessionStore = Depends(get_session_store_dep)
+    session_store: SessionStore = Depends(get_session_store_dep),
+    doc_store: DocumentVectorStoreService = Depends(get_document_vector_store_dep),
 ) -> RateResponse:
     """Collect user rating and feedback, terminating the session."""
     session = session_store.get_session(payload.session_id)
@@ -285,6 +289,17 @@ async def rate_conversation(
         target_state=SessionState.END,
         action_name="rate_conversation"
     )
+
+    # Session has definitively ended: clean up any uploaded document immediately
+    # rather than waiting for the background TTL sweep.
+    try:
+        deleted = doc_store.delete_session_documents(session.session_id)
+        if deleted:
+            logger.info(f"Cleaned up {deleted} document chunk(s) for ended session {session.session_id}.")
+    except Exception as exc:
+        # Cleanup failure shouldn't block the user from seeing their thank-you message;
+        # the background sweep will catch it later via SESSION_DOC_TTL_SECONDS.
+        logger.warning(f"Document cleanup failed for session {session.session_id}: {exc}")
 
     thank_you_message = (
         f"Thank you for your {payload.rating}-star rating! "

@@ -86,6 +86,20 @@ class SessionStore:
                 raise SessionNotFoundException(session_id)
             return session
 
+    def list_stale_session_ids(self, ttl_seconds: int) -> List[str]:
+        """Return session IDs whose last activity is older than ttl_seconds.
+
+        Used by the periodic cleanup sweep to find abandoned sessions (e.g. the
+        user closed the tab without reaching the END state) so their uploaded
+        document vectors don't accumulate indefinitely in ChromaDB.
+        """
+        cutoff = datetime.now(timezone.utc).timestamp() - ttl_seconds
+        with self._lock:
+            return [
+                sid for sid, session in self._sessions.items()
+                if session.updated_at.timestamp() < cutoff
+            ]
+
     def transition_state(
         self,
         session_id: str,

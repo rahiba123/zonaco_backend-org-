@@ -183,10 +183,6 @@ class VectorStoreService:
         except Exception:
             return False
 
-# ---------------------------------------------------------------------------
-# Singleton FAQ vector store instance (the only vector store defined here).
-# User-uploaded document vector store lives in document_store.py.
-# ---------------------------------------------------------------------------
 
 # Singleton vector store service instance
 vector_store_service = VectorStoreService()
@@ -195,4 +191,3 @@ vector_store_service = VectorStoreService()
 def get_vector_store() -> VectorStoreService:
     """Dependency injection provider for VectorStoreService."""
     return vector_store_service
-

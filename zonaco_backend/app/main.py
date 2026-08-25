@@ -1,5 +1,6 @@
 """FastAPI main application entry point for Zanaco FAQ Chatbot."""
 
+import asyncio
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -7,12 +8,42 @@ from fastapi.responses import JSONResponse
 from slowapi.errors import RateLimitExceeded
 from app.config import get_settings
 from app.dependencies import limiter
-from app.routers import categories, chat, session
+from app.routers import categories, chat, documents, session
+from app.services.document_store import get_document_vector_store
+from app.services.session_store import get_session_store
 from app.services.vector_store import get_vector_store
 from app.utils.exceptions import register_exception_handlers
 from app.utils.logger import logger
 
 settings = get_settings()
+
+
+async def _stale_document_cleanup_loop():
+    """Background sweep: periodically deletes uploaded document vectors for sessions
+    that have been idle longer than SESSION_DOC_TTL_SECONDS. This catches sessions
+    that never reach /chat/rate (e.g. the user just closes the tab), so ChromaDB's
+    user_uploaded_documents collection doesn't grow unbounded.
+    """
+    session_store = get_session_store()
+    doc_store = get_document_vector_store()
+
+    while True:
+        try:
+            await asyncio.sleep(settings.SESSION_DOC_CLEANUP_INTERVAL_SECONDS)
+            stale_ids = session_store.list_stale_session_ids(settings.SESSION_DOC_TTL_SECONDS)
+            total_deleted = 0
+            for session_id in stale_ids:
+                if doc_store.has_documents(session_id):
+                    total_deleted += doc_store.delete_session_documents(session_id)
+            if total_deleted:
+                logger.info(
+                    f"Stale-document sweep: removed {total_deleted} chunk(s) across "
+                    f"{len(stale_ids)} idle session(s)."
+                )
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            logger.warning(f"Stale-document cleanup sweep encountered an error: {exc}")
 
 
 @asynccontextmanager
@@ -34,8 +65,19 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         logger.error(f"Vector store initialization check encountered error: {exc}")
 
+    cleanup_task = asyncio.create_task(_stale_document_cleanup_loop())
+    logger.info(
+        f"Started background document cleanup sweep "
+        f"(every {settings.SESSION_DOC_CLEANUP_INTERVAL_SECONDS}s, TTL {settings.SESSION_DOC_TTL_SECONDS}s)."
+    )
+
     yield
 
+    cleanup_task.cancel()
+    try:
+        await cleanup_task
+    except asyncio.CancelledError:
+        pass
     logger.info("Shutting down Zanaco FAQ Chatbot Backend...")
 
 
@@ -48,7 +90,7 @@ app = FastAPI(
     ),
     version="1.0.0",
     docs_url="/docs",
-    redoc_url="/redoc",
+    redoc_url=None,
     openapi_url="/openapi.json",
     lifespan=lifespan
 )
@@ -88,6 +130,7 @@ app.add_middleware(
 app.include_router(session.router)
 app.include_router(categories.router)
 app.include_router(chat.router)
+app.include_router(documents.router)
 
 
 @app.get("/", include_in_schema=False)

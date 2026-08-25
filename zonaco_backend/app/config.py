@@ -53,6 +53,44 @@ class Settings(BaseSettings):
         description="Number of top context chunks to retrieve"
     )
 
+    # User-Uploaded Document RAG (session-scoped, separate from the fixed FAQ KB)
+    USER_DOCS_COLLECTION_NAME: str = Field(
+        default="user_uploaded_documents",
+        description="ChromaDB collection name for session-scoped user-uploaded documents"
+    )
+    USER_DOC_SIMILARITY_THRESHOLD: float = Field(
+        default=0.35,
+        description=(
+            "Minimum cosine similarity for an uploaded-document chunk to be considered "
+            "relevant. Lower than the FAQ threshold on purpose: below this, we fall back "
+            "to general LLM knowledge instead of refusing to answer."
+        )
+    )
+    USER_DOC_TOP_K: int = Field(
+        default=4,
+        description="Number of top chunks to retrieve from a user's uploaded document"
+    )
+    GENERAL_LLM_FALLBACK_ENABLED: bool = Field(
+        default=False,
+        description=(
+            "If True, when a question matches neither the uploaded document nor the FAQ "
+            "knowledge base, answer using the LLM's general knowledge (clearly labeled as "
+            "unofficial). If False (default, safer for banking), fall back to the existing "
+            "live-agent escalation prompt instead of risking an ungrounded financial answer."
+        )
+    )
+    SESSION_DOC_TTL_SECONDS: int = Field(
+        default=86400,  # 24 hours
+        description=(
+            "How long an idle session's uploaded document stays indexed before the "
+            "background sweep deletes it, for sessions that never reach /chat/rate."
+        )
+    )
+    SESSION_DOC_CLEANUP_INTERVAL_SECONDS: int = Field(
+        default=3600,  # 1 hour
+        description="How often the background sweep checks for and removes stale session documents."
+    )
+
     # Server & Security
     HOST: str = Field(default="0.0.0.0", description="API host")
     PORT: int = Field(default=8000, description="API port")
