@@ -24,7 +24,8 @@ from app.utils.logger import logger, log_chat_interaction
 
 # --- (a) Filler opener patterns ---
 _FILLER_PATTERNS = [
-    r"^Based on the (?:context|FAQ context|document excerpts?|information|provided (?:context|information|excerpt))[,.]?\s*",
+    # Covers: "Based on the context", "Based on the provided document excerpts", etc.
+    r"^Based on (?:the |this |these |our )?(?:provided |above |following |available |given |uploaded )?(?:context|FAQ(?: context)?|document(?: excerpts?)?|information|excerpt|excerpts|records)[,.]?\s*",
     r"^According to (?:the (?:FAQ|context|document|provided context|excerpt)|our (?:FAQ|records))[,.]?\s*",
     r"^From the (?:FAQ|context|document|provided (?:context|information))[,.]?\s*",
     r"^Using the (?:FAQ|context|provided (?:context|information|excerpt))[,.]?\s*",
@@ -478,14 +479,16 @@ class RAGService:
             "X-Title": "Zanaco FAQ Chatbot Backend",
         }
 
-        # Candidate models ordered by priority
+        # Candidate models ordered by priority.
+        # Primary model comes from settings (OPENROUTER_MODEL env var).
+        # Fallbacks are tried in order if the primary fails.
         candidate_models = [self.settings.OPENROUTER_MODEL]
         fallback_models = [
-            "nvidia/nemotron-nano-9b-v2:free",
-            "google/gemma-4-26b-a4b-it:free",
-            "nvidia/nemotron-3.5-lightning:free",
-            "openai/gpt-oss-20b:free",
-            "z-ai/glm-5.2:free",
+            "liquid/lfm-2.5-2.6b:free",
+            "google/gemma-2-9b-it:free",
+            "meta-llama/llama-3.1-8b-instruct:free",
+            "microsoft/phi-3-mini-128k-instruct:free",
+            "huggingfaceh4/zephyr-7b-beta:free",
         ]
         for fb in fallback_models:
             if fb not in candidate_models:
@@ -503,7 +506,7 @@ class RAGService:
                         {"role": "user", "content": user_content}
                     ],
                     "temperature": 0.2,
-                    "max_tokens": 600,
+                    "max_tokens": 1024,
                 }
                 logger.info(f"Calling OpenRouter model '{model_id}'...")
 
@@ -512,9 +515,19 @@ class RAGService:
                     if response.status_code == 200:
                         data = response.json()
                         choices = data.get("choices", [])
-                        if choices and "message" in choices[0]:
-                            answer_text = choices[0]["message"].get("content", "").strip()
-                            return _strip_llm_filler(answer_text)
+                        if choices:
+                            message = choices[0].get("message")
+                            # Some models return message=None when content is null
+                            # (e.g. finish_reason=tool_calls). Treat as empty.
+                            content = (message or {}).get("content") or ""
+                            answer_text = content.strip()
+                            if answer_text:
+                                return _strip_llm_filler(answer_text)
+                            logger.warning(
+                                f"OpenRouter model '{model_id}' returned empty content; trying next model."
+                            )
+                            last_error = f"Model '{model_id}' returned empty content"
+                            continue
 
                     logger.warning(
                         f"OpenRouter model '{model_id}' failed with status {response.status_code}: {response.text}"

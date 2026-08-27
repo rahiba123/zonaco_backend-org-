@@ -21,7 +21,7 @@ class Settings(BaseSettings):
         description="API key for OpenRouter LLM access"
     )
     OPENROUTER_MODEL: str = Field(
-        default="nvidia/nemotron-nano-9b-v2:free",
+        default="liquid/lfm-2.5-2.6b:free",
         description="Free-tier OpenRouter instruct model name"
     )
     OPENROUTER_BASE_URL: str = Field(
