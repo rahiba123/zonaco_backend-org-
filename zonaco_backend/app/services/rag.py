@@ -20,6 +20,15 @@ from app.utils.logger import logger, log_chat_interaction
 #       or <think>...</think> XML tags.
 #
 # We strip both layers so users always receive a clean, direct reply.
+#
+# NOTE: as of this version, the primary defense against reasoning leakage is
+# the OpenRouter `reasoning` request parameter (see _call_openrouter), which
+# asks supporting models to suppress or exclude reasoning tokens at the API
+# level. The regex/pattern logic below remains as a text-level safety net for
+# models that don't honor that parameter, plus a circuit breaker
+# (_looks_like_reasoning_leak) that catches novel leak phrasing we haven't
+# seen before, so an unrecognized leak triggers a fallback to the next
+# candidate model instead of shipping bad text to a customer.
 # ---------------------------------------------------------------------------
 
 # --- (a) Filler opener patterns ---
@@ -62,8 +71,12 @@ _THINKING_STEP_RE = re.compile(
 
 # Regex that detects "Draft:", "Answer:", "Final Answer:", "Response:" markers
 # — the model writes reasoning then uses one of these to signal the actual answer.
+# Also matches variants with a trailing parenthetical, e.g.
+# "Final answer draft (must be final output only):", since models that draft
+# multiple attempts sometimes annotate later markers this way.
 _DRAFT_MARKER_RE = re.compile(
-    r"(?:^|\n)\s*(?:Draft|Answer|Final Answer|Final Response|Response|My (?:Answer|Response))\s*:\s*",
+    r"(?:^|\n)\s*(?:Draft|Answer|Final Answer|Final Response|Response|Final answer draft|"
+    r"Possible answer(?: structure)?|My (?:Answer|Response))\s*(?:\([^)]{0,120}\))?\s*:\s*",
     re.IGNORECASE,
 )
 
@@ -106,22 +119,34 @@ _EXPLICIT_DOC_RE = re.compile("|".join(_EXPLICIT_DOC_PATTERNS), re.IGNORECASE)
 
 # Paragraph-level patterns that identify reasoning / meta-commentary lines.
 # If a paragraph matches ANY of these it is dropped from the final answer.
+#
+# NOTE: the "I ..." and "Here's/Let's ..." patterns are intentionally narrower
+# than a naive "starts with I" or "starts with Here's" match. Once the global
+# is_thinking_dump trigger fires, every paragraph in the response — including
+# the model's genuine final answer — gets tested against this list. A broad
+# pattern like `^I(?:'ll| will| can| think)` would also match a perfectly
+# legitimate customer-facing answer such as "I can confirm the daily ATM
+# withdrawal limit is..." or "Here's how to reset your PIN:", silently
+# deleting the real answer and falling through to the "not enough
+# information" message. These patterns require actual meta-reasoning
+# language (check/verify/analyze/re-read/etc.), not just a common sentence
+# opener, to avoid that false-positive failure mode.
 _REASONING_PARA_PATTERNS = [
     re.compile(r"^\d+\.\s+\*{0,2}(?:Scan|Analyze|Determine|Consider|Review|Evaluate|Plan|Step|Understand|Identify|Look|Check)", re.IGNORECASE),
-    re.compile(r"^(?:Here(?:'s| is)|Let(?:'s| me| us))", re.IGNORECASE),
-    re.compile(r"^I(?:'ll| will| need to| should| must| can| am going to)", re.IGNORECASE),
-    re.compile(r"^(?:Key point|Key info|Key parts|Note:|Note that|Note -)", re.IGNORECASE),
-    re.compile(r"^(?:All|The) (?:document|context|FAQ|excerpt|section)s? (?:consistently |always |clearly )?(?:say|state|indicate|mention|show|discuss|talk)", re.IGNORECASE),
-    re.compile(r"^(?:Let'?s? (?:craft|structure|write|draft|build|form|create|compose|think about|consider|re-read) the (?:answer|response|reply|document|section))", re.IGNORECASE),
+    re.compile(r"^I(?:'ll| will)? (?:need to|should|must) (?:check|verify|analyze|determine|figure out|look at|make sure|confirm whether)\b", re.IGNORECASE),
+    re.compile(r"^(?:Here(?:'s| is) (?:my|the) (?:thinking|analysis|reasoning)|Let(?:'s| me| us) (?:think|check|see|analyze|consider|figure|re-read))", re.IGNORECASE),
+    re.compile(r"^(?:Key point|Key info|Key parts|Note:|Note that|Note -|The key information is)", re.IGNORECASE),
+    re.compile(r"^(?:All|The) (?:document|context|FAQ|excerpt|section)s? (?:consistently |always |clearly )?(?:say|state|indicate|mention|show|discuss|talk|cuts off|ends)", re.IGNORECASE),
+    re.compile(r"^(?:Let'?s? (?:craft|structure|write|draft|build|form|create|compose|think about|consider|re-read) the (?:answer|response|reply|document|section|rule))", re.IGNORECASE),
     re.compile(r"^(?:Draft|Planning|Outline|Summary of context|Key points across)", re.IGNORECASE),
     re.compile(r"^(?:- User query:|- Selected Category:|- I need to)", re.IGNORECASE),
     re.compile(r"^(?:Okay|Alright|Sure|Right),?\s+(?:so\s+)?(?:let|I|the)", re.IGNORECASE),
     re.compile(r"^(?:-?\s*(?:First|Second|Third|Fourth|Fifth|Sixth|Seventh|Eighth|Ninth|Tenth|\d+(?:st|nd|rd|th)?)\s+(?:section|part|chapter|excerpt)|-?\s*Section \d+[:\s]|Section \d+ covers)", re.IGNORECASE),
     re.compile(r"^(?:Excerpt|Chapter) \d+[:\s]", re.IGNORECASE),
-    re.compile(r"^(?:So from the excerpts|So from the document|The question is:|Based strictly on the document excerpts|The answer should reflect|Check against constraints:)", re.IGNORECASE),
+    re.compile(r"^(?:So from the excerpts|So from the document|The question is|The question\s*:|Based strictly on the document excerpts|The answer should reflect|Check against constraints:)", re.IGNORECASE),
     re.compile(r"^(?:Only final customer-facing answer:|No thinking process/reasoning:)", re.IGNORECASE),
     re.compile(r"^(?:Constraint check|Check against|Verification of constraints):?", re.IGNORECASE),
-    re.compile(r"^(?:Wait,|Actually,|Let me re-read|Is there a direct statement|I don't see an explicit list|This suggests that|Reading the first section|Also: \"|The question: \"|The question\s*:|But I need to be)", re.IGNORECASE),
+    re.compile(r"^(?:Wait,|Actually,|Let me re-read|Is there a direct statement|I don't see an explicit list|This suggests that|Reading the first section|Also: \"|The question: \"|The question\s*:|But I need to be|The specific invocation|The sentence is incomplete|Since the excerpt|Since it's cut off|Is the information enough|Looking at the structure|Given the strict rule|However, the rule|The core instruction|It's a heading|The exact phrasing)", re.IGNORECASE),
 ]
 
 
@@ -133,18 +158,57 @@ def _is_reasoning_paragraph(para: str) -> bool:
     return False
 
 
+# Phrases that indicate the model is quoting or paraphrasing its own system
+# instructions back into the output — a 100%-reliable tell that something
+# leaked, regardless of where in the text it appears or what specific wording
+# surrounds it. This is a circuit breaker, not a text-cleaning pass: if this
+# fires after _strip_llm_filler has already run, the answer is treated as a
+# failed generation and the caller falls through to the next candidate model,
+# rather than trying to salvage or further edit the text.
+_INSTRUCTION_LEAK_RE = re.compile(
+    r"\b(?:no reasoning|must output only|final output only|i must output|"
+    r"only the final answer|customer-facing answer only|check against constraints|"
+    r"constraint check|no thinking process)\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_reasoning_leak(text: str) -> bool:
+    """Detect reasoning/meta-commentary leakage that survived _strip_llm_filler.
+
+    This is intentionally conservative and pattern-based rather than trying to
+    enumerate every possible leak phrasing (that list will always be one step
+    behind whatever a given free-tier model does next). It looks for a small
+    number of high-confidence signals:
+      - the model quoting its own system-prompt instructions back
+      - a multi-section walkthrough ("Section 1 ... Section 2 ...")
+      - visible backtracking language ("Wait,", "Actually,")
+    """
+    if _INSTRUCTION_LEAK_RE.search(text):
+        return True
+    if len(re.findall(r"^-?\s*Section \d+", text, re.MULTILINE)) >= 2:
+        return True
+    if re.search(r"\b(?:Wait|Actually),", text):
+        return True
+    return False
+
+
 def _extract_answer_from_thinking_block(text: str) -> str:
     """Pull the customer-facing answer out of a thinking dump.
 
     Strategy (in priority order):
-    1. If model used a 'Draft:' / 'Answer:' marker, take everything after it.
+    1. If model used a 'Draft:' / 'Answer:' marker, take everything after the
+       LAST such marker (models that draft-and-revise tend to converge toward
+       the end, so the first marker often still contains leftover reasoning).
     2. Otherwise filter paragraphs by removing all reasoning-looking ones.
-    3. Fallback: return the last paragraph.
+    3. Fallback: extract non-reasoning lines from the last paragraph, or a
+       clean "not enough information" message if nothing usable remains.
     """
-    # Strategy 1 — explicit answer marker
-    marker_match = _DRAFT_MARKER_RE.search(text)
-    if marker_match:
-        after_marker = text[marker_match.end():].strip()
+    # Strategy 1 — explicit answer marker: use the LAST marker match, since
+    # models sometimes draft multiple attempts before settling on a final one.
+    marker_matches = list(_DRAFT_MARKER_RE.finditer(text))
+    if marker_matches:
+        after_marker = text[marker_matches[-1].end():].strip()
         if after_marker:
             return after_marker
 
@@ -163,8 +227,16 @@ def _extract_answer_from_thinking_block(text: str) -> str:
     if answer_paragraphs:
         return "\n\n".join(answer_paragraphs)
 
-    # Strategy 3 — fallback: last paragraph
-    return paragraphs[-1]
+    # Strategy 3 — if all paragraphs were CoT dumps, extract non-reasoning lines from the last paragraph
+    last_para = paragraphs[-1]
+    non_reasoning_lines = [
+        line.strip() for line in last_para.split("\n")
+        if line.strip() and not _is_reasoning_paragraph(line.strip())
+    ]
+    if non_reasoning_lines:
+        return "\n".join(non_reasoning_lines)
+
+    return "The provided document excerpts do not contain enough information to answer this question."
 
 
 def _strip_thinking_block(text: str) -> str:
@@ -192,6 +264,8 @@ def _strip_thinking_block(text: str) -> str:
         or bool(re.search(r"Key parts about", result, re.IGNORECASE))
         or bool(re.search(r"So from the document", result, re.IGNORECASE))
         or bool(re.search(r"But I need to be very careful", result, re.IGNORECASE))
+        or bool(re.search(r"The sentence is incomplete", result, re.IGNORECASE))
+        or bool(re.search(r"Given the strict rule", result, re.IGNORECASE))
     )
 
     if is_thinking_dump:
@@ -595,6 +669,15 @@ class RAGService:
         url = f"{self.settings.OPENROUTER_BASE_URL.rstrip('/')}/chat/completions"
         last_error = None
 
+        # Reasoning-suppression config applied to every request. Asks supporting
+        # models to skip visible reasoning entirely ("effort": "none"); as a
+        # belt-and-suspenders, "exclude": True keeps any reasoning tokens a
+        # model can't fully disable out of the `content` field. Not every
+        # model on OpenRouter honors this, which is why the text-level
+        # cleanup (_strip_llm_filler) and the leak circuit breaker
+        # (_looks_like_reasoning_leak) below remain in place as a safety net.
+        reasoning_config = {"effort": "none", "exclude": True}
+
         async with httpx.AsyncClient(timeout=30.0) as client:
             for model_id in candidate_models:
                 payload = {
@@ -605,6 +688,7 @@ class RAGService:
                     ],
                     "temperature": 0.2,
                     "max_tokens": 1024,
+                    "reasoning": reasoning_config,
                 }
                 logger.info(f"Calling OpenRouter model '{model_id}'...")
 
@@ -620,7 +704,14 @@ class RAGService:
                             content = (message or {}).get("content") or ""
                             answer_text = content.strip()
                             if answer_text:
-                                return _strip_llm_filler(answer_text)
+                                cleaned = _strip_llm_filler(answer_text)
+                                if _looks_like_reasoning_leak(cleaned):
+                                    logger.warning(
+                                        f"OpenRouter model '{model_id}' leaked reasoning after cleanup; trying next model."
+                                    )
+                                    last_error = f"Model '{model_id}' leaked reasoning"
+                                    continue
+                                return cleaned
                             logger.warning(
                                 f"OpenRouter model '{model_id}' returned empty content; trying next model."
                             )
@@ -660,6 +751,7 @@ class RAGService:
                             ],
                             "temperature": 0.2,
                             "max_tokens": 1024,
+                            "reasoning": reasoning_config,
                         }
                         try:
                             response = await client.post(url, headers=headers, json=payload)
@@ -669,7 +761,13 @@ class RAGService:
                                 if choices:
                                     content = (choices[0].get("message") or {}).get("content") or ""
                                     if content.strip():
-                                        return _strip_llm_filler(content.strip())
+                                        cleaned = _strip_llm_filler(content.strip())
+                                        if _looks_like_reasoning_leak(cleaned):
+                                            logger.warning(
+                                                f"Dynamically discovered model '{model_id}' leaked reasoning after cleanup; trying next model."
+                                            )
+                                            continue
+                                        return cleaned
                         except Exception:
                             continue
             except Exception as exc:

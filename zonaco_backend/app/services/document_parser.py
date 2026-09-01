@@ -108,17 +108,27 @@ class DocumentParser:
         return "\n".join(p.text for p in doc.paragraphs)
 
     def chunk_text(self, text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> List[str]:
-        """Sliding-window character chunker with whitespace normalization."""
+        """Sliding-window chunker breaking cleanly on sentence/word boundaries."""
         normalized = " ".join(text.split())
         if not normalized:
             return []
 
         chunks: List[str] = []
         start = 0
-        while start < len(normalized):
-            end = start + chunk_size
-            chunks.append(normalized[start:end])
-            start += chunk_size - overlap
+        text_len = len(normalized)
+        while start < text_len:
+            end = min(start + chunk_size, text_len)
+            if end < text_len:
+                # Try breaking at a sentence boundary or word boundary
+                boundary = max(normalized.rfind('. ', start, end), normalized.rfind(' ', start, end))
+                if boundary > start + (chunk_size // 2):
+                    end = boundary + 1
+
+            chunk = normalized[start:end].strip()
+            if chunk:
+                chunks.append(chunk)
+
+            start = end if end >= text_len else max(end - overlap, start + 1)
         return chunks
 
     def parse(self, session_id: str, filename: str, file_bytes: bytes) -> List[DocumentChunk]:
