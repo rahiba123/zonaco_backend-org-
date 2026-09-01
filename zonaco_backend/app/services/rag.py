@@ -107,15 +107,21 @@ _EXPLICIT_DOC_RE = re.compile("|".join(_EXPLICIT_DOC_PATTERNS), re.IGNORECASE)
 # Paragraph-level patterns that identify reasoning / meta-commentary lines.
 # If a paragraph matches ANY of these it is dropped from the final answer.
 _REASONING_PARA_PATTERNS = [
-    re.compile(r"^\d+\.\s+\*{0,2}(?:Analyze|Determine|Consider|Review|Evaluate|Plan|Step|Understand|Identify)", re.IGNORECASE),
+    re.compile(r"^\d+\.\s+\*{0,2}(?:Scan|Analyze|Determine|Consider|Review|Evaluate|Plan|Step|Understand|Identify|Look|Check)", re.IGNORECASE),
     re.compile(r"^(?:Here(?:'s| is)|Let(?:'s| me| us))", re.IGNORECASE),
     re.compile(r"^I(?:'ll| will| need to| should| must| can| am going to)", re.IGNORECASE),
-    re.compile(r"^(?:Key point|Key info|Note:|Note that|Note -)", re.IGNORECASE),
-    re.compile(r"^(?:All|The) (?:document|context|FAQ|excerpt)s? (?:consistently |always |clearly )?(?:say|state|indicate|mention|show)", re.IGNORECASE),
-    re.compile(r"^(?:Let'?s? (?:craft|structure|write|draft|build|form|create|compose|think about|consider) the (?:answer|response|reply))", re.IGNORECASE),
+    re.compile(r"^(?:Key point|Key info|Key parts|Note:|Note that|Note -)", re.IGNORECASE),
+    re.compile(r"^(?:All|The) (?:document|context|FAQ|excerpt|section)s? (?:consistently |always |clearly )?(?:say|state|indicate|mention|show|discuss|talk)", re.IGNORECASE),
+    re.compile(r"^(?:Let'?s? (?:craft|structure|write|draft|build|form|create|compose|think about|consider|re-read) the (?:answer|response|reply|document|section))", re.IGNORECASE),
     re.compile(r"^(?:Draft|Planning|Outline|Summary of context|Key points across)", re.IGNORECASE),
     re.compile(r"^(?:- User query:|- Selected Category:|- I need to)", re.IGNORECASE),
     re.compile(r"^(?:Okay|Alright|Sure|Right),?\s+(?:so\s+)?(?:let|I|the)", re.IGNORECASE),
+    re.compile(r"^(?:-?\s*(?:First|Second|Third|Fourth|Fifth|Sixth|Seventh|Eighth|Ninth|Tenth|\d+(?:st|nd|rd|th)?)\s+(?:section|part|chapter|excerpt)|-?\s*Section \d+[:\s]|Section \d+ covers)", re.IGNORECASE),
+    re.compile(r"^(?:Excerpt|Chapter) \d+[:\s]", re.IGNORECASE),
+    re.compile(r"^(?:So from the excerpts|So from the document|The question is:|Based strictly on the document excerpts|The answer should reflect|Check against constraints:)", re.IGNORECASE),
+    re.compile(r"^(?:Only final customer-facing answer:|No thinking process/reasoning:)", re.IGNORECASE),
+    re.compile(r"^(?:Constraint check|Check against|Verification of constraints):?", re.IGNORECASE),
+    re.compile(r"^(?:Wait,|Actually,|Let me re-read|Is there a direct statement|I don't see an explicit list|This suggests that|Reading the first section|Also: \"|The question: \"|The question\s*:|But I need to be)", re.IGNORECASE),
 ]
 
 
@@ -151,7 +157,7 @@ def _extract_answer_from_thinking_block(text: str) -> str:
         p for p in paragraphs
         if not _is_reasoning_paragraph(p)
         and not _THINKING_STEP_RE.match(p)
-        and len(p) > 40  # skip very short transition fragments
+        and len(p) > 30  # skip short transition fragments
     ]
 
     if answer_paragraphs:
@@ -177,6 +183,15 @@ def _strip_thinking_block(text: str) -> str:
         or bool(re.match(r"^All (?:document|context|FAQ)s? (?:consistently )?(?:say|state|indicate)", result, re.IGNORECASE))
         or bool(re.match(r"^Let'?s? (?:craft|structure|write|draft|think about)", result, re.IGNORECASE))
         or bool(re.search(r"\nDraft\s*:", result, re.IGNORECASE))
+        or bool(re.search(r"Excerpt\s+\d+\s*:", result, re.IGNORECASE))
+        or bool(re.search(r"(?:First|Second|Third|Fourth|Fifth|Sixth)\s+section\s*:", result, re.IGNORECASE))
+        or bool(re.search(r"Section\s+\d+\s*:", result, re.IGNORECASE))
+        or bool(re.search(r"Check against constraints:", result, re.IGNORECASE))
+        or bool(re.search(r"Wait,\s+let me", result, re.IGNORECASE))
+        or bool(re.search(r"Is there a direct statement", result, re.IGNORECASE))
+        or bool(re.search(r"Key parts about", result, re.IGNORECASE))
+        or bool(re.search(r"So from the document", result, re.IGNORECASE))
+        or bool(re.search(r"But I need to be very careful", result, re.IGNORECASE))
     )
 
     if is_thinking_dump:
@@ -191,6 +206,7 @@ def _strip_llm_filler(text: str) -> str:
     Applied after every LLM call so users always receive a direct, clean answer.
     Pass 1: Remove thinking/reasoning blocks (reasoning model leakage).
     Pass 2: Remove filler opener phrases (up to 3 iterations).
+    Pass 3: Strip lingering Excerpt/Section citations, echo questions, or internal meta headers.
     """
     # Pass 1 — thinking block removal
     cleaned = _strip_thinking_block(text)
@@ -203,6 +219,14 @@ def _strip_llm_filler(text: str) -> str:
         if new:
             new = new[0].upper() + new[1:]
         cleaned = new
+
+    # Pass 3 — Strip lingering Excerpt X / Section X citations, echo questions, or meta prefixes
+    cleaned = re.sub(r"\b(?:According to|In|From|As stated in)?\s*(?:Excerpt|Section)\s+\d+[:\.,]?\s*", "", cleaned, flags=re.IGNORECASE).strip()
+    cleaned = re.sub(r"^(?:What|How|Which|Can|Does|Is|Are)\b.*?\?\s*(?:Based on (?:the |this )?doc(?:ument)?:\s*)?", "", cleaned, flags=re.IGNORECASE).strip()
+    cleaned = re.sub(r"^Based on (?:the |this )?(?:doc|document|excerpts?)[:\.,]?\s*", "", cleaned, flags=re.IGNORECASE).strip()
+
+    if cleaned and cleaned[0].islower():
+        cleaned = cleaned[0].upper() + cleaned[1:]
 
     return cleaned
 
@@ -225,17 +249,27 @@ STRICT GUIDELINES:
 """
 
 # Used when answering from a document the user uploaded in this session.
-DOCUMENT_SYSTEM_PROMPT = """You are a helpful assistant answering questions about a document the customer uploaded
-during this chat session, on behalf of Zambia National Commercial Bank (Zanaco).
+DOCUMENT_SYSTEM_PROMPT = """You are the official AI Customer Support Assistant for Zambia National Commercial Bank (Zanaco), answering questions strictly based on a document uploaded by the customer during this session.
 
-CRITICAL OUTPUT RULE: Output ONLY the final customer-facing answer. Do NOT include any thinking process, reasoning steps, numbered analysis, internal deliberation, self-reflection, or meta-commentary. Do NOT write things like "Here's a thinking process", "Let me analyze", "Step 1:", or any similar internal reasoning. Start your response directly with the answer.
+CRITICAL OUTPUT RULE: Output ONLY the final customer-facing answer — nothing else.
+
+Do NOT include, under any circumstances:
+- A section-by-section or chapter-by-chapter walkthrough of the document ("Section 1 covers...", "Section 2 mentions...")
+- Self-directed questions or exploratory reasoning ("Is there a direct statement about...?", "Let me re-read carefully")
+- Backtracking or revision language ("Wait,", "Actually,", "Let me reconsider")
+- Meta-commentary about what you found, how you searched, or how confident you are in your own reasoning
+- Thinking process, numbered analysis steps, internal deliberation, or draft markers like "Draft:" or "Answer:"
+
+Instead, synthesize the relevant facts from the excerpts into a single, direct, well-organized answer as if you already knew it — the way a knowledgeable bank employee would explain it in one pass, not the way someone would think out loud while researching it.
 
 STRICT GUIDELINES:
-1. Grounding: Answer ONLY using the information in the provided document excerpts below.
-2. No Hallucinations: NEVER invent information that isn't in the document excerpts.
-3. Tone: Professional, courteous, and clear.
-4. Attribution: Make it clear the answer comes from the document the customer uploaded, not from Zanaco's official FAQ.
-5. Incomplete Coverage: If the excerpts don't fully answer the question, say so plainly rather than guessing.
+1. Grounding: Answer ONLY using explicit facts in the provided document context below. Do NOT use general knowledge, assumptions, or information from outside the document. Do not invent or infer facts that are not explicitly stated.
+2. Direct Statements: Before answering, identify whether the document contains a direct statement answering the question. If it does, use that direct statement directly rather than constructing an answer from indirect references.
+3. Terminology Preservation: Use the EXACT terminology used in the document whenever possible. Do NOT rename, alter, or reinterpret concepts.
+4. Definition Questions: For definition or description questions, provide only the definition or description stated in the document. Do NOT expand the definition using outside knowledge.
+5. Incomplete Coverage: If the provided document context does not contain enough information to answer the question, say so plainly:
+   "The provided document excerpts do not contain enough information to answer this question."
+   Do NOT guess.
 """
 
 # Used only when GENERAL_LLM_FALLBACK_ENABLED=True and neither the document nor the FAQ matched.
@@ -336,7 +370,7 @@ class RAGService:
 
             context_blocks = []
             for idx, res in enumerate(doc_results, 1):
-                context_blocks.append(f"[Excerpt {idx} from '{res.source_filename}']\n{res.text}")
+                context_blocks.append(f"--- Document Section ---\n{res.text}")
             context_str = "\n\n".join(context_blocks)
 
             if is_summary_query:
@@ -546,11 +580,13 @@ class RAGService:
         # Fallbacks are tried in order if the primary fails.
         candidate_models = [self.settings.OPENROUTER_MODEL]
         fallback_models = [
+            "nvidia/nemotron-3.5-lightning:free",
+            "inclusionai/ling-3.0-flash-fin:free",
+            "minimax/minimax-m2.7:free",
             "liquid/lfm-2.5-2.6b:free",
-            "google/gemma-2-9b-it:free",
-            "meta-llama/llama-3.1-8b-instruct:free",
-            "microsoft/phi-3-mini-128k-instruct:free",
-            "huggingfaceh4/zephyr-7b-beta:free",
+            "minimax/minimax-m3:free",
+            "nvidia/nemotron-3-super-120b-a12b:free",
+            "z-ai/glm-5.2:free",
         ]
         for fb in fallback_models:
             if fb not in candidate_models:
@@ -602,6 +638,42 @@ class RAGService:
                 except httpx.RequestError as exc:
                     logger.warning(f"Network error with model '{model_id}': {exc}")
                     last_error = str(exc)
+
+            # Dynamic Discovery Fallback: Fetch currently active :free models from OpenRouter API if static list fails
+            try:
+                logger.info("Attempting dynamic OpenRouter model discovery...")
+                models_url = f"{self.settings.OPENROUTER_BASE_URL.rstrip('/')}/models"
+                models_res = await client.get(models_url, headers=headers)
+                if models_res.status_code == 200:
+                    data = models_res.json()
+                    dynamic_models = [
+                        m["id"] for m in data.get("data", [])
+                        if isinstance(m, dict) and ":free" in m.get("id", "") and m.get("id") not in candidate_models
+                    ]
+                    for model_id in dynamic_models[:5]:
+                        logger.info(f"Calling dynamically discovered OpenRouter model '{model_id}'...")
+                        payload = {
+                            "model": model_id,
+                            "messages": [
+                                {"role": "system", "content": system_prompt},
+                                {"role": "user", "content": user_content}
+                            ],
+                            "temperature": 0.2,
+                            "max_tokens": 1024,
+                        }
+                        try:
+                            response = await client.post(url, headers=headers, json=payload)
+                            if response.status_code == 200:
+                                data = response.json()
+                                choices = data.get("choices", [])
+                                if choices:
+                                    content = (choices[0].get("message") or {}).get("content") or ""
+                                    if content.strip():
+                                        return _strip_llm_filler(content.strip())
+                        except Exception:
+                            continue
+            except Exception as exc:
+                logger.warning(f"Dynamic OpenRouter model discovery failed: {exc}")
 
         logger.error(f"All candidate OpenRouter models failed. Last error: {last_error}")
         raise LLMServiceException(f"Failed to generate answer from LLM provider: {last_error}")
