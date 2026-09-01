@@ -2,7 +2,22 @@
 
 import os
 from unittest.mock import AsyncMock, patch
-import pytest
+try:
+    import pytest
+except ImportError:
+    class _PytestMock:
+        def raises(self, exc):
+            import contextlib
+            @contextlib.contextmanager
+            def _cm():
+                try:
+                    yield
+                except exc:
+                    pass
+                else:
+                    raise AssertionError(f"Expected exception {exc} was not raised.")
+            return _cm()
+    pytest = _PytestMock()
 from fastapi.testclient import TestClient
 from app.main import app
 from app.services.excel_parser import ExcelFAQParser
@@ -215,3 +230,33 @@ def test_agent_escalation_flow():
     assert esc_data["current_state"] == "LIVE_AGENT"
     assert "agent_queue_ticket" in esc_data
     assert "ZNCO-ESC-" in esc_data["agent_queue_ticket"]
+
+
+@patch("app.services.rag.RAGService._call_openrouter")
+def test_document_summary_and_explicit_query(mock_llm):
+    """Test asking for summary of uploaded document routes correctly to user document RAG."""
+    mock_llm.return_value = "This document provides an overview of Oracle FLEXCUBE Core Services (CS)."
+
+    # 1. Upload sample document
+    txt_content = b"Oracle FLEXCUBE Universal Banking 12.0.3 Core Services CS overview and maintenance parameters."
+    upload_res = client.post(
+        "/documents/upload",
+        files={"file": ("flexcube_cs.txt", txt_content, "text/plain")}
+    )
+    assert upload_res.status_code == 200
+    session_id = upload_res.json()["session_id"]
+
+    # 2. Ask summary question
+    ask_res = client.post(
+        "/chat/ask",
+        json={
+            "session_id": session_id,
+            "question": "explain the summary of this document"
+        }
+    )
+    assert ask_res.status_code == 200
+    ask_data = ask_res.json()
+    assert ask_data["answer_source"] == "user_document"
+    assert "Oracle FLEXCUBE" in ask_data["answer"]
+    assert ask_data["should_offer_escalation"] is False
+

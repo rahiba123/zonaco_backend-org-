@@ -180,6 +180,44 @@ class DocumentVectorStoreService:
             logger.exception(f"Failed to delete documents for session {session_id}: {exc}")
             raise VectorStoreException(f"Failed to delete session documents: {exc}")
 
+    def get_all_chunks(self, session_id: str, limit: int = 30) -> List[DocumentSearchResult]:
+        """Retrieve indexed document chunks for a session ordered sequentially by chunk_index."""
+        if not self.collection:
+            self._initialize()
+
+        try:
+            results = self.collection.get(
+                where={"session_id": session_id},
+                limit=limit,
+                include=["documents", "metadatas"]
+            )
+        except Exception as exc:
+            logger.exception(f"Failed to fetch session document chunks: {exc}")
+            raise VectorStoreException(f"Failed to fetch session document chunks: {exc}")
+
+        search_results: List[DocumentSearchResult] = []
+        if not results or not results.get("ids"):
+            return search_results
+
+        ids = results["ids"]
+        documents = results.get("documents", [])
+        metadatas = results.get("metadatas", [])
+
+        for doc_id, doc_text, meta in zip(ids, documents, metadatas):
+            search_results.append(
+                DocumentSearchResult(
+                    doc_id=doc_id,
+                    text=doc_text,
+                    source_filename=meta.get("source_filename", "") if meta else "",
+                    chunk_index=int(meta.get("chunk_index", 0)) if meta else 0,
+                    similarity_score=1.0,
+                    distance=0.0
+                )
+            )
+
+        search_results.sort(key=lambda x: x.chunk_index)
+        return search_results
+
 
 # Singleton instance, following the same pattern as vector_store.py
 document_vector_store_service = DocumentVectorStoreService()

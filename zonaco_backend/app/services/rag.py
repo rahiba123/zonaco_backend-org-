@@ -67,6 +67,43 @@ _DRAFT_MARKER_RE = re.compile(
     re.IGNORECASE,
 )
 
+# User-Uploaded Document Summary & Explicit Intent Detection
+_SUMMARY_QUERY_PATTERNS = [
+    r"\bsummary\b",
+    r"\bsummarize\b",
+    r"\bsummarise\b",
+    r"\boverview\b",
+    r"\bmain points?\b",
+    r"\bkey points?\b",
+    r"\bgist\b",
+    r"\bsynopsis\b",
+    r"\bbrief\b",
+    r"\bwhat is (?:this|the|my|uploaded)?\s*(?:pdf|docx|txt|document|file)\s*about\b",
+    r"\bwhat (?:does|is) (?:this|the|my|uploaded)?\s*(?:pdf|docx|txt|document|file)\s*(?:cover|contain|say|about)\b",
+    r"\bexplain (?:this|the|my|uploaded)?\s*(?:pdf|docx|txt|document|file)\b",
+    r"\babout (?:this|the|my|uploaded)?\s*(?:pdf|docx|txt|document|file)\b",
+    r"\bexplain (?:the )?summary\b",
+]
+_SUMMARY_QUERY_RE = re.compile("|".join(_SUMMARY_QUERY_PATTERNS), re.IGNORECASE)
+
+_EXPLICIT_DOC_PATTERNS = [
+    r"\bthis document\b",
+    r"\bthe document\b",
+    r"\buploaded document\b",
+    r"\bmy document\b",
+    r"\bthis file\b",
+    r"\bthe file\b",
+    r"\buploaded file\b",
+    r"\bmy file\b",
+    r"\bthis pdf\b",
+    r"\bthe pdf\b",
+    r"\buploaded pdf\b",
+    r"\bin this document\b",
+    r"\bfrom this document\b",
+    r"\baccording to (?:this|the) document\b",
+]
+_EXPLICIT_DOC_RE = re.compile("|".join(_EXPLICIT_DOC_PATTERNS), re.IGNORECASE)
+
 # Paragraph-level patterns that identify reasoning / meta-commentary lines.
 # If a paragraph matches ANY of these it is dropped from the final answer.
 _REASONING_PARA_PATTERNS = [
@@ -271,6 +308,10 @@ class RAGService:
     async def _try_answer_from_document(self, session_id: str, question: str) -> Optional[RAGResponse]:
         """Attempt to answer from the session's uploaded document. Returns None if not a confident match."""
         start_time = time.perf_counter()
+
+        is_summary_query = bool(_SUMMARY_QUERY_RE.search(question))
+        is_explicit_doc_query = bool(_EXPLICIT_DOC_RE.search(question))
+
         doc_results: List[DocumentSearchResult] = self.document_vector_store.query(
             session_id=session_id,
             query_text=question,
@@ -280,48 +321,69 @@ class RAGService:
         top_doc = doc_results[0] if doc_results else None
         top_score = top_doc.similarity_score if top_doc else 0.0
 
-        if not top_doc or top_score < self.settings.USER_DOC_SIMILARITY_THRESHOLD:
-            logger.info(
-                f"Session {session_id}: uploaded document top score {top_score:.3f} below "
-                f"threshold {self.settings.USER_DOC_SIMILARITY_THRESHOLD}; falling back to FAQ."
+        # Handle summary/overview queries or explicit document references or standard high-similarity matches
+        if is_summary_query or is_explicit_doc_query or (top_doc and top_score >= self.settings.USER_DOC_SIMILARITY_THRESHOLD):
+            # For summary queries or explicit document queries with low vector scores, fetch sequential chunks
+            if is_summary_query or (is_explicit_doc_query and top_score < self.settings.USER_DOC_SIMILARITY_THRESHOLD):
+                all_chunks = self.document_vector_store.get_all_chunks(session_id=session_id, limit=30)
+                if all_chunks:
+                    doc_results = all_chunks
+                    top_score = max(top_score, 0.90)
+
+            if not doc_results:
+                logger.info(f"Session {session_id}: no document chunks found for session.")
+                return None
+
+            context_blocks = []
+            for idx, res in enumerate(doc_results, 1):
+                context_blocks.append(f"[Excerpt {idx} from '{res.source_filename}']\n{res.text}")
+            context_str = "\n\n".join(context_blocks)
+
+            if is_summary_query:
+                user_prompt = (
+                    f"Customer Question: {question}\n\n"
+                    f"--- Document Excerpts ---\n"
+                    f"{context_str}\n"
+                    f"--- End of Document Excerpts ---\n\n"
+                    f"Provide a clear, detailed, and direct summary of the uploaded document based strictly on the excerpts above."
+                )
+            else:
+                user_prompt = (
+                    f"Customer Question: {question}\n\n"
+                    f"--- Document Excerpts ---\n"
+                    f"{context_str}\n"
+                    f"--- End of Document Excerpts ---\n\n"
+                    f"Answer the customer's question using only the excerpts above."
+                )
+
+            generated_answer = await self._call_openrouter(user_prompt, system_prompt=DOCUMENT_SYSTEM_PROMPT)
+
+            latency_ms = (time.perf_counter() - start_time) * 1000
+            log_chat_interaction(
+                session_id=session_id,
+                question=question,
+                category=None,
+                confidence_score=top_score,
+                matched_intent=None,
+                should_offer_escalation=False,
+                latency_ms=latency_ms
             )
-            return None
 
-        context_blocks = []
-        for idx, res in enumerate(doc_results, 1):
-            context_blocks.append(f"[Excerpt {idx} from '{res.source_filename}']\n{res.text}")
-        context_str = "\n\n".join(context_blocks)
+            return RAGResponse(
+                answer=generated_answer,
+                matched_faq_intent=None,
+                links=[],
+                confidence_score=top_score,
+                should_offer_escalation=False,
+                answer_source="user_document",
+                retrieved_sources=[]
+            )
 
-        user_prompt = (
-            f"Customer Question: {question}\n\n"
-            f"--- Document Excerpts ---\n"
-            f"{context_str}\n"
-            f"--- End of Document Excerpts ---\n\n"
-            f"Answer the customer's question using only the excerpts above."
+        logger.info(
+            f"Session {session_id}: uploaded document top score {top_score:.3f} below "
+            f"threshold {self.settings.USER_DOC_SIMILARITY_THRESHOLD}; falling back to FAQ."
         )
-
-        generated_answer = await self._call_openrouter(user_prompt, system_prompt=DOCUMENT_SYSTEM_PROMPT)
-
-        latency_ms = (time.perf_counter() - start_time) * 1000
-        log_chat_interaction(
-            session_id=session_id,
-            question=question,
-            category=None,
-            confidence_score=top_score,
-            matched_intent=None,
-            should_offer_escalation=False,
-            latency_ms=latency_ms
-        )
-
-        return RAGResponse(
-            answer=generated_answer,
-            matched_faq_intent=None,
-            links=[],
-            confidence_score=top_score,
-            should_offer_escalation=False,
-            answer_source="user_document",
-            retrieved_sources=[]
-        )
+        return None
 
     async def _answer_from_faq(
         self,
