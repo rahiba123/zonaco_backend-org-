@@ -31,7 +31,7 @@ limiter = get_limiter()
     response_model=UploadDocumentResponse,
     summary="Upload a document for this session",
     description=(
-        "Accepts a PDF, DOCX, or TXT file, extracts and chunks its text, embeds it, "
+        "Accepts a PDF, DOCX, TXT, XLSX, XLS, CSV, or Markdown file, extracts and chunks its text, embeds it, "
         "and indexes it in a session-scoped vector store. Once uploaded, questions sent "
         "to /chat/ask will be checked against this document before falling back to the "
         "FAQ knowledge base or general LLM knowledge."

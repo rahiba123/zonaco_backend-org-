@@ -1,4 +1,4 @@
-"""Parser for user-uploaded documents (PDF / DOCX / TXT) with chunking for embedding.
+"""Parser for user-uploaded documents (PDF / DOCX / TXT / XLSX / XLS / CSV / MD) with chunking for embedding.
 
 Mirrors the structure of `excel_parser.py` so it fits the existing service layer:
 each parsed chunk becomes a small dataclass with a deterministic doc_id and a
@@ -16,7 +16,7 @@ from app.utils.logger import logger
 # Chunking parameters — tune based on your embedding model's context window.
 CHUNK_SIZE = 800       # characters per chunk
 CHUNK_OVERLAP = 150    # overlap between consecutive chunks
-ALLOWED_EXTENSIONS = {".pdf", ".docx", ".txt"}
+ALLOWED_EXTENSIONS = {".pdf", ".docx", ".txt", ".xlsx", ".xls", ".csv", ".md", ".markdown"}
 MAX_FILE_SIZE_BYTES = 15 * 1024 * 1024  # 15 MB safety cap
 
 
@@ -63,7 +63,7 @@ class DocumentChunk:
 
 
 class DocumentParser:
-    """Extracts and chunks text from uploaded PDF/DOCX/TXT files."""
+    """Extracts and chunks text from uploaded PDF/DOCX/TXT/XLSX/XLS/CSV/MD files."""
 
     def validate(self, filename: str, file_bytes: bytes) -> None:
         """Raise if the file type or size isn't acceptable. Call before parsing."""
@@ -83,8 +83,12 @@ class DocumentParser:
                 return self._extract_pdf(file_bytes)
             if ext == ".docx":
                 return self._extract_docx(file_bytes)
-            if ext == ".txt":
+            if ext in (".txt", ".md", ".markdown"):
                 return file_bytes.decode("utf-8", errors="ignore")
+            if ext in (".xlsx", ".xls"):
+                return self._extract_excel(file_bytes, filename)
+            if ext == ".csv":
+                return self._extract_csv(file_bytes)
             raise UnsupportedFileTypeException(filename)
         except UnsupportedFileTypeException:
             raise
@@ -106,6 +110,57 @@ class DocumentParser:
 
         doc = docx.Document(BytesIO(file_bytes))
         return "\n".join(p.text for p in doc.paragraphs)
+
+    def _extract_excel(self, file_bytes: bytes, filename: str) -> str:
+        from io import BytesIO
+        ext = os.path.splitext(filename)[1].lower()
+        if ext == ".xlsx":
+            try:
+                import openpyxl
+                wb = openpyxl.load_workbook(BytesIO(file_bytes), data_only=True)
+                text_parts = []
+                for sheet_name in wb.sheetnames:
+                    sheet = wb[sheet_name]
+                    rows = list(sheet.iter_rows(values_only=True))
+                    if not rows:
+                        continue
+                    text_parts.append(f"Sheet: {sheet_name}")
+                    for row in rows:
+                        if not row or all(c is None or str(c).strip() == "" for c in row):
+                            continue
+                        row_str = " | ".join(str(c).strip() for c in row if c is not None and str(c).strip() != "")
+                        if row_str:
+                            text_parts.append(row_str)
+                wb.close()
+                return "\n".join(text_parts)
+            except Exception as exc:
+                logger.warning(f"openpyxl failed for '{filename}', trying pandas fallback: {exc}")
+
+        try:
+            import pandas as pd
+            excel_file = pd.ExcelFile(BytesIO(file_bytes))
+            text_parts = []
+            for sheet_name in excel_file.sheet_names:
+                df = pd.read_excel(excel_file, sheet_name=sheet_name)
+                if df.empty:
+                    continue
+                text_parts.append(f"Sheet: {sheet_name}")
+                text_parts.append(df.to_string(index=False))
+            return "\n".join(text_parts)
+        except Exception as exc:
+            raise Exception(f"Excel parsing failed: {exc}")
+
+    def _extract_csv(self, file_bytes: bytes) -> str:
+        import csv
+        import io
+
+        content = file_bytes.decode("utf-8", errors="ignore")
+        reader = csv.reader(io.StringIO(content))
+        lines = []
+        for row in reader:
+            if any(cell.strip() for cell in row):
+                lines.append(" | ".join(cell.strip() for cell in row if cell.strip()))
+        return "\n".join(lines)
 
     def chunk_text(self, text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> List[str]:
         """Sliding-window chunker breaking cleanly on sentence/word boundaries."""

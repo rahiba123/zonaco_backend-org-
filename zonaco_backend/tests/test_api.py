@@ -260,3 +260,63 @@ def test_document_summary_and_explicit_query(mock_llm):
     assert "Oracle FLEXCUBE" in ask_data["answer"]
     assert ask_data["should_offer_escalation"] is False
 
+
+def test_upload_csv_document():
+    """Test uploading a CSV document."""
+    csv_content = b"Account Type,Interest Rate,Minimum Balance\nSavings,4.5%,100 ZMW\nFixed Deposit,8.0%,1000 ZMW"
+    upload_res = client.post(
+        "/documents/upload",
+        files={"file": ("rates.csv", csv_content, "text/csv")}
+    )
+    assert upload_res.status_code == 200
+    assert upload_res.json()["filename"] == "rates.csv"
+    assert upload_res.json()["chunks_indexed"] > 0
+
+
+def test_upload_excel_document():
+    """Test uploading an Excel (.xlsx) document."""
+    import openpyxl
+    from io import BytesIO
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Loan Products"
+    ws.append(["Product", "Interest Rate", "Max Tenure"])
+    ws.append(["Personal Loan", "18%", "36 Months"])
+    ws.append(["Home Loan", "12%", "240 Months"])
+    buffer = BytesIO()
+    wb.save(buffer)
+    xlsx_bytes = buffer.getvalue()
+
+    upload_res = client.post(
+        "/documents/upload",
+        files={"file": ("loan_products.xlsx", xlsx_bytes, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")}
+    )
+    assert upload_res.status_code == 200
+    assert upload_res.json()["filename"] == "loan_products.xlsx"
+    assert upload_res.json()["chunks_indexed"] > 0
+
+
+def test_upload_markdown_document():
+    """Test uploading a Markdown (.md) document."""
+    md_content = b"# Zanaco Express Services\n\n- Cash deposit\n- Cash withdrawal\n- Utility bill payment"
+    upload_res = client.post(
+        "/documents/upload",
+        files={"file": ("express.md", md_content, "text/markdown")}
+    )
+    assert upload_res.status_code == 200
+    assert upload_res.json()["filename"] == "express.md"
+    assert upload_res.json()["chunks_indexed"] > 0
+
+
+def test_unsupported_document_type():
+    """Test uploading an unsupported file type returns 400."""
+    exe_content = b"MZ\x90\x00\x03\x00\x00\x00"
+    upload_res = client.post(
+        "/documents/upload",
+        files={"file": ("malicious.exe", exe_content, "application/octet-stream")}
+    )
+    assert upload_res.status_code == 400
+    assert upload_res.json()["error"] is True
+
+
