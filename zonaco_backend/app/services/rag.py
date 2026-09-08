@@ -7,7 +7,6 @@ from typing import List, Optional
 import httpx
 from app.config import get_settings
 from app.services.document_store import DocumentSearchResult, DocumentVectorStoreService, get_document_vector_store
-from app.services.vector_store import SearchResult, VectorStoreService, get_vector_store
 from app.utils.exceptions import LLMServiceException
 from app.utils.logger import logger, log_chat_interaction
 
@@ -371,7 +370,7 @@ class RAGResponse:
     confidence_score: float
     should_offer_escalation: bool
     answer_source: str = "faq"  # "faq" | "user_document" | "general_llm"
-    retrieved_sources: List[SearchResult] = field(default_factory=list)
+    retrieved_sources: List[DocumentSearchResult] = field(default_factory=list)
 
 
 class RAGService:
@@ -379,11 +378,9 @@ class RAGService:
 
     def __init__(
         self,
-        vector_store: Optional[VectorStoreService] = None,
         document_vector_store: Optional[DocumentVectorStoreService] = None,
     ):
         self.settings = get_settings()
-        self.vector_store = vector_store or get_vector_store()
         self.document_vector_store = document_vector_store or get_document_vector_store()
 
     async def answer_question(
@@ -392,25 +389,25 @@ class RAGService:
         question: str,
         category: Optional[str] = None
     ) -> RAGResponse:
-        """Execute full routing workflow:
+        """Execute document Q&A workflow:
 
-        1. If this session has an uploaded document AND the question is a good match for it,
-           answer strictly from that document.
-        2. Otherwise, fall back to the existing FAQ knowledge-base pipeline.
-        3. If FAQ also doesn't match and GENERAL_LLM_FALLBACK_ENABLED is on, answer from the
-           LLM's general knowledge (clearly labeled unofficial). Otherwise offer live-agent escalation.
+        If this session has an uploaded document, answer strictly from that document.
+        Otherwise, ask the user to upload a document.
         """
-        doc_was_checked = False
-
-        # Step 0: Try the session's uploaded document first, if one exists.
         if self.document_vector_store.has_documents(session_id):
             doc_response = await self._try_answer_from_document(session_id, question)
             if doc_response is not None:
                 return doc_response
-            # Document was checked but didn't match — remember this for the fallback message.
-            doc_was_checked = True
 
-        return await self._answer_from_faq(session_id, question, category, doc_was_checked=doc_was_checked)
+        return RAGResponse(
+            answer="I could not find information regarding your query in the uploaded document.",
+            matched_faq_intent=None,
+            links=[],
+            confidence_score=0.0,
+            should_offer_escalation=False,
+            answer_source="user_document",
+            retrieved_sources=[]
+        )
 
 
     async def _try_answer_from_document(self, session_id: str, question: str) -> Optional[RAGResponse]:
@@ -429,9 +426,8 @@ class RAGService:
         top_doc = doc_results[0] if doc_results else None
         top_score = top_doc.similarity_score if top_doc else 0.0
 
-        # Handle summary/overview queries or explicit document references or standard high-similarity matches
-        if is_summary_query or is_explicit_doc_query or (top_doc and top_score >= self.settings.USER_DOC_SIMILARITY_THRESHOLD):
-            # For summary queries or explicit document queries with low vector scores, fetch sequential chunks
+        # Handle summary/overview queries or explicit document references or standard matches
+        if is_summary_query or is_explicit_doc_query or (top_doc and top_score >= self.settings.USER_DOC_SIMILARITY_THRESHOLD) or doc_results:
             if is_summary_query or (is_explicit_doc_query and top_score < self.settings.USER_DOC_SIMILARITY_THRESHOLD):
                 all_chunks = self.document_vector_store.get_all_chunks(session_id=session_id, limit=30)
                 if all_chunks:
@@ -487,153 +483,7 @@ class RAGService:
                 retrieved_sources=[]
             )
 
-        logger.info(
-            f"Session {session_id}: uploaded document top score {top_score:.3f} below "
-            f"threshold {self.settings.USER_DOC_SIMILARITY_THRESHOLD}; falling back to FAQ."
-        )
         return None
-
-    async def _answer_from_faq(
-        self,
-        session_id: str,
-        question: str,
-        category: Optional[str] = None,
-        doc_was_checked: bool = False
-    ) -> RAGResponse:
-        """Original FAQ-grounded RAG pipeline, with optional general-LLM fallback.
-
-        Args:
-            doc_was_checked: True when an uploaded document was queried but scored below
-                             threshold, so the fallback message can tell the user both
-                             sources were checked.
-        """
-        start_time = time.perf_counter()
-
-        # Step 1: Scoped Vector Retrieval
-        search_results = self.vector_store.query(
-            query_text=question,
-            category=category,
-            n_results=self.settings.TOP_K
-        )
-
-        top_match: Optional[SearchResult] = search_results[0] if search_results else None
-        top_score = top_match.similarity_score if top_match else 0.0
-        top_intent = top_match.faq_intent if top_match else None
-
-        # Gather deduplicated links from top matches
-        collected_links: List[str] = []
-        for res in search_results:
-            for link in res.links:
-                if link and link not in collected_links:
-                    collected_links.append(link)
-
-        # Step 2: Confidence Threshold Evaluation
-        if top_score < self.settings.SIMILARITY_THRESHOLD or not top_match:
-            latency_ms = (time.perf_counter() - start_time) * 1000
-
-            if self.settings.GENERAL_LLM_FALLBACK_ENABLED:
-                general_answer = await self._call_openrouter(
-                    f"Customer Question: {question}",
-                    system_prompt=GENERAL_KNOWLEDGE_SYSTEM_PROMPT
-                )
-                log_chat_interaction(
-                    session_id=session_id,
-                    question=question,
-                    category=category,
-                    confidence_score=top_score,
-                    matched_intent=top_intent,
-                    should_offer_escalation=False,
-                    latency_ms=latency_ms
-                )
-                return RAGResponse(
-                    answer=general_answer,
-                    matched_faq_intent=top_intent,
-                    links=collected_links,
-                    confidence_score=top_score,
-                    should_offer_escalation=False,
-                    answer_source="general_llm",
-                    retrieved_sources=search_results
-                )
-
-            # Build a context-aware fallback message
-            if doc_was_checked:
-                fallback_answer = (
-                    "I checked both your uploaded document and our official FAQ knowledge base, "
-                    "but I couldn't find a relevant answer to your question in either source. "
-                    "Would you like to connect with a Zanaco customer support agent who can assist you further?"
-                )
-            else:
-                fallback_answer = (
-                    "I'm sorry, I couldn't find an exact answer to your inquiry in our official FAQ knowledge base. "
-                    "Would you like to connect with a Zanaco customer support agent for further assistance?"
-                )
-            log_chat_interaction(
-                session_id=session_id,
-                question=question,
-                category=category,
-                confidence_score=top_score,
-                matched_intent=top_intent,
-                should_offer_escalation=True,
-                latency_ms=latency_ms
-            )
-            return RAGResponse(
-                answer=fallback_answer,
-                matched_faq_intent=top_intent,
-                links=collected_links,
-                confidence_score=top_score,
-                should_offer_escalation=True,
-                answer_source="faq",
-                retrieved_sources=search_results
-            )
-
-
-
-        # Step 3: Construct Context from Retrieved Documents
-        context_blocks = []
-        for idx, res in enumerate(search_results, 1):
-            block = (
-                f"[Document {idx} - Category: {res.category} | Intent: {res.faq_intent}]\n"
-                f"Question: {res.question}\n"
-                f"Response: {res.response}"
-            )
-            if res.details:
-                block += f"\nDetails: {res.details}"
-            context_blocks.append(block)
-
-        context_str = "\n\n".join(context_blocks)
-
-        user_prompt = (
-            f"Customer Inquiry: {question}\n\n"
-            f"Selected Category: {category or 'General'}\n\n"
-            f"--- FAQ Context ---\n"
-            f"{context_str}\n"
-            f"--- End of FAQ Context ---\n\n"
-            f"Please provide a direct, helpful, and accurate response based strictly on the above context."
-        )
-
-        # Step 4: Call OpenRouter LLM
-        generated_answer = await self._call_openrouter(user_prompt, system_prompt=BANKING_SYSTEM_PROMPT)
-
-        latency_ms = (time.perf_counter() - start_time) * 1000
-        log_chat_interaction(
-            session_id=session_id,
-            question=question,
-            category=category,
-            confidence_score=top_score,
-            matched_intent=top_intent,
-            should_offer_escalation=False,
-            latency_ms=latency_ms
-        )
-
-        return RAGResponse(
-            answer=generated_answer,
-            matched_faq_intent=top_intent,
-            links=collected_links,
-            confidence_score=top_score,
-            should_offer_escalation=False,
-            answer_source="faq",
-            retrieved_sources=search_results
-        )
 
     async def _call_openrouter(self, user_content: str, system_prompt: str = BANKING_SYSTEM_PROMPT) -> str:
         """Execute async HTTP POST request to OpenRouter chat completions with candidate fallbacks."""

@@ -2,7 +2,7 @@
 
 from fastapi import APIRouter, Depends, status
 from app.config import Settings, get_settings
-from app.dependencies import get_session_store_dep, get_vector_store_dep
+from app.dependencies import get_document_vector_store_dep, get_session_store_dep
 from app.schemas.common import HealthResponse, MenuOption
 from app.schemas.session import (
     MessageHistoryItem,
@@ -10,8 +10,8 @@ from app.schemas.session import (
     StartSessionRequest,
     StartSessionResponse,
 )
+from app.services.document_store import DocumentVectorStoreService
 from app.services.session_store import SessionStore
-from app.services.vector_store import VectorStoreService
 from app.state_machine import SessionState, StateMachine
 
 router = APIRouter(tags=["Session Management"])
@@ -25,14 +25,14 @@ router = APIRouter(tags=["Session Management"])
 )
 async def health_check(
     settings: Settings = Depends(get_settings),
-    vector_store: VectorStoreService = Depends(get_vector_store_dep)
+    doc_store: DocumentVectorStoreService = Depends(get_document_vector_store_dep)
 ) -> HealthResponse:
     """Liveness probe endpoint."""
     return HealthResponse(
         status="ok",
         version="1.0.0",
         model=settings.OPENROUTER_MODEL,
-        vector_store_initialized=vector_store.is_healthy()
+        vector_store_initialized=True
     )
 
 

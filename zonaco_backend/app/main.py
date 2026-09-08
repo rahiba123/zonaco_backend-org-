@@ -1,4 +1,4 @@
-"""FastAPI main application entry point for Zanaco FAQ Chatbot."""
+"""FastAPI main application entry point for Document Chatbot."""
 
 import asyncio
 from contextlib import asynccontextmanager
@@ -8,10 +8,9 @@ from fastapi.responses import JSONResponse
 from slowapi.errors import RateLimitExceeded
 from app.config import get_settings
 from app.dependencies import limiter
-from app.routers import categories, chat, documents, session
+from app.routers import chat, documents, session
 from app.services.document_store import get_document_vector_store
 from app.services.session_store import get_session_store
-from app.services.vector_store import get_vector_store
 from app.utils.exceptions import register_exception_handlers
 from app.utils.logger import logger
 
@@ -19,11 +18,7 @@ settings = get_settings()
 
 
 async def _stale_document_cleanup_loop():
-    """Background sweep: periodically deletes uploaded document vectors for sessions
-    that have been idle longer than SESSION_DOC_TTL_SECONDS. This catches sessions
-    that never reach /chat/rate (e.g. the user just closes the tab), so ChromaDB's
-    user_uploaded_documents collection doesn't grow unbounded.
-    """
+    """Background sweep: periodically deletes uploaded document vectors for idle sessions."""
     session_store = get_session_store()
     doc_store = get_document_vector_store()
 
@@ -49,21 +44,9 @@ async def _stale_document_cleanup_loop():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan context manager for startup and shutdown hooks."""
-    logger.info("Starting Zanaco FAQ Chatbot Backend...")
+    logger.info("Starting Document Chatbot Backend...")
     logger.info(f"Configured OpenRouter model: {settings.OPENROUTER_MODEL}")
     logger.info(f"Vector database path: {settings.VECTOR_DB_PATH}")
-
-    # Ensure vector store is initialized
-    try:
-        vs = get_vector_store()
-        doc_count = vs.count()
-        logger.info(f"ChromaDB ready with {doc_count} indexed FAQ documents.")
-        if doc_count == 0:
-            logger.warning(
-                "ChromaDB has 0 documents! Please run 'python ingest.py' to index the FAQ knowledge base."
-            )
-    except Exception as exc:
-        logger.error(f"Vector store initialization check encountered error: {exc}")
 
     cleanup_task = asyncio.create_task(_stale_document_cleanup_loop())
     logger.info(
@@ -78,16 +61,13 @@ async def lifespan(app: FastAPI):
         await cleanup_task
     except asyncio.CancelledError:
         pass
-    logger.info("Shutting down Zanaco FAQ Chatbot Backend...")
+    logger.info("Shutting down Document Chatbot Backend...")
 
 
 # FastAPI application instance
 app = FastAPI(
-    title="Zanaco Banking FAQ Chatbot API",
-    description=(
-        "Production-ready customer support chatbot backend for Zambia National Commercial Bank (Zanaco). "
-        "Implements a state machine session lifecycle, scoped ChromaDB vector retrieval, and OpenRouter RAG."
-    ),
+    title="Document Chatbot API",
+    description="Customer support chatbot backend with document upload and grounded RAG Q&A.",
     version="1.0.0",
     docs_url="/docs",
     redoc_url=None,
@@ -128,7 +108,6 @@ app.add_middleware(
 
 # Register API Routers
 app.include_router(session.router)
-app.include_router(categories.router)
 app.include_router(chat.router)
 app.include_router(documents.router)
 
@@ -137,7 +116,7 @@ app.include_router(documents.router)
 async def root():
     """Root redirect to API documentation."""
     return {
-        "service": "Zanaco Banking FAQ Chatbot Backend",
+        "service": "Document Chatbot Backend",
         "status": "operational",
         "docs": "/docs",
         "health": "/health"
