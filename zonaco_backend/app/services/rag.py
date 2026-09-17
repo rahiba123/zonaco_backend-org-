@@ -8,6 +8,7 @@ import httpx
 from app.config import get_settings
 from app.services.document_store import DocumentSearchResult, DocumentVectorStoreService, get_document_vector_store
 from app.utils.exceptions import LLMServiceException
+from app.utils.language import detect_language, MULTILINGUAL_DOCUMENT_SYSTEM_PROMPT
 from app.utils.logger import logger, log_chat_interaction
 
 # ---------------------------------------------------------------------------
@@ -414,6 +415,9 @@ class RAGService:
         """Attempt to answer from the session's uploaded document. Returns None if not a confident match."""
         start_time = time.perf_counter()
 
+        question_lang = detect_language(question)
+        logger.info(f"Session {session_id}: Detected question language '{question_lang}' for query.")
+
         is_summary_query = bool(_SUMMARY_QUERY_RE.search(question))
         is_explicit_doc_query = bool(_EXPLICIT_DOC_RE.search(question))
 
@@ -426,9 +430,10 @@ class RAGService:
         top_doc = doc_results[0] if doc_results else None
         top_score = top_doc.similarity_score if top_doc else 0.0
 
-        # Handle summary/overview queries or explicit document references or standard matches
+        # Handle summary/overview queries, explicit document references, or standard matches.
+        # Fall back to all document chunks if similarity score is low (e.g. cross-lingual retrieval).
         if is_summary_query or is_explicit_doc_query or (top_doc and top_score >= self.settings.USER_DOC_SIMILARITY_THRESHOLD) or doc_results:
-            if is_summary_query or (is_explicit_doc_query and top_score < self.settings.USER_DOC_SIMILARITY_THRESHOLD):
+            if is_summary_query or (is_explicit_doc_query and top_score < self.settings.USER_DOC_SIMILARITY_THRESHOLD) or top_score < self.settings.USER_DOC_SIMILARITY_THRESHOLD:
                 all_chunks = self.document_vector_store.get_all_chunks(session_id=session_id, limit=30)
                 if all_chunks:
                     doc_results = all_chunks
@@ -443,24 +448,28 @@ class RAGService:
                 context_blocks.append(f"--- Document Section ---\n{res.text}")
             context_str = "\n\n".join(context_blocks)
 
+            system_prompt = MULTILINGUAL_DOCUMENT_SYSTEM_PROMPT.format(question_language=question_lang)
+
             if is_summary_query:
                 user_prompt = (
-                    f"Customer Question: {question}\n\n"
+                    f"Customer Question (in {question_lang}): {question}\n\n"
                     f"--- Document Excerpts ---\n"
                     f"{context_str}\n"
                     f"--- End of Document Excerpts ---\n\n"
-                    f"Provide a clear, detailed, and direct summary of the uploaded document based strictly on the excerpts above."
+                    f"Provide a clear, detailed, and direct summary of the uploaded document based strictly on the excerpts above. "
+                    f"You MUST provide your answer in {question_lang}."
                 )
             else:
                 user_prompt = (
-                    f"Customer Question: {question}\n\n"
+                    f"Customer Question (in {question_lang}): {question}\n\n"
                     f"--- Document Excerpts ---\n"
                     f"{context_str}\n"
                     f"--- End of Document Excerpts ---\n\n"
-                    f"Answer the customer's question using only the excerpts above."
+                    f"Answer the customer's question using only the excerpts above. "
+                    f"You MUST provide your answer in {question_lang}."
                 )
 
-            generated_answer = await self._call_openrouter(user_prompt, system_prompt=DOCUMENT_SYSTEM_PROMPT)
+            generated_answer = await self._call_openrouter(user_prompt, system_prompt=system_prompt)
 
             latency_ms = (time.perf_counter() - start_time) * 1000
             log_chat_interaction(
