@@ -21,6 +21,7 @@ from chromadb.utils import embedding_functions
 from app.config import get_settings
 from app.services.document_parser import DocumentChunk
 from app.utils.exceptions import VectorStoreException
+from app.utils.language import check_embedding_multilingual_support
 from app.utils.logger import logger
 
 
@@ -67,6 +68,7 @@ class DocumentVectorStoreService:
             self.embedding_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
                 model_name=self.settings.EMBEDDING_MODEL_NAME
             )
+            check_embedding_multilingual_support(self.settings.EMBEDDING_MODEL_NAME)
 
             self.collection = self.client.get_or_create_collection(
                 name=self.settings.USER_DOCS_COLLECTION_NAME,
