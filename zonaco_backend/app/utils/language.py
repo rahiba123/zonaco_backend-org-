@@ -23,13 +23,40 @@ SCRIPT_RANGES = [
     (r'[\u0590-\u05FF]', "Hebrew"),
 ]
 
-# Simple keyword/character heuristics for common Latin-script languages
+# Stopword sets for Latin-script languages
 LATIN_STOPWORDS = {
-    "French": ["le", "la", "les", "du", "des", "est", "une", "dans", "pour", "pas", "sur", "avec", "qui", "que", "ce", "cette", "sont", "nous", "vous", "ils", "elles", "au", "aux"],
-    "Spanish": ["el", "la", "los", "las", "un", "una", "del", "por", "para", "con", "como", "mas", "pero", "sus", "este", "esta", "estos", "estas", "son", "que", "en"],
-    "German": ["der", "die", "das", "und", "ist", "sie", "nicht", "mit", "sich", "auf", "für", "dem", "den", "ein", "eine", "einer", "eines", "aus", "nach", "oder", "über"],
-    "Italian": ["il", "la", "le", "i", "gli", "un", "una", "che", "non", "per", "del", "della", "con", "della", "delle", "sono", "questo", "questa", "più"],
-    "Portuguese": ["o", "a", "os", "as", "um", "uma", "do", "da", "dos", "das", "em", "para", "com", "não", "por", "que", "como", "mais", "este", "esta"],
+    "English": {
+        "the", "be", "to", "of", "and", "a", "in", "that", "have", "it", "for", "not", "on", "with",
+        "he", "as", "you", "do", "at", "this", "but", "his", "by", "from", "they", "we", "say", "her",
+        "she", "or", "an", "will", "my", "one", "all", "would", "there", "their", "what", "so", "up",
+        "out", "if", "about", "who", "get", "which", "go", "me", "when", "make", "can", "like", "time",
+        "no", "just", "him", "know", "take", "people", "into", "year", "your", "good", "some", "could",
+        "them", "see", "other", "than", "then", "now", "look", "only", "come", "its", "over", "think",
+        "also", "back", "after", "use", "two", "how", "our", "work", "first", "well", "way", "even",
+        "new", "want", "because", "any", "these", "give", "day", "most", "us", "does", "is", "are",
+        "was", "were", "been", "has", "had", "allow", "allows", "allowed", "allowing"
+    },
+    "French": {
+        "le", "la", "les", "du", "des", "est", "une", "un", "dans", "pour", "pas", "sur", "avec",
+        "qui", "que", "ce", "cette", "sont", "nous", "vous", "ils", "elles", "au", "aux", "est-ce",
+        "comment", "pourquoi", "quel", "quelle", "quand"
+    },
+    "Spanish": {
+        "el", "la", "los", "las", "un", "una", "del", "por", "para", "con", "como", "mas", "pero",
+        "sus", "este", "esta", "estos", "estas", "son", "que", "en", "cual", "cuales", "donde", "quien"
+    },
+    "German": {
+        "der", "die", "das", "und", "ist", "sie", "nicht", "mit", "sich", "auf", "für", "dem", "den",
+        "ein", "eine", "einer", "eines", "aus", "nach", "oder", "über", "wie", "was", "welche", "warum"
+    },
+    "Italian": {
+        "il", "la", "le", "i", "gli", "un", "una", "che", "non", "per", "del", "della", "con", "della",
+        "delle", "sono", "questo", "questa", "più", "come", "quale", "cosa"
+    },
+    "Portuguese": {
+        "o", "a", "os", "as", "um", "uma", "do", "da", "dos", "das", "em", "para", "com", "não",
+        "por", "que", "como", "mais", "este", "esta", "quais", "qual"
+    },
 }
 
 
@@ -54,15 +81,16 @@ def detect_language(text: str) -> str:
     lang_scores: Dict[str, int] = {}
     for lang, stopwords in LATIN_STOPWORDS.items():
         score = sum(1 for w in words if w in stopwords)
-        if score > 0:
-            lang_scores[lang] = score
+        lang_scores[lang] = score
 
-    if lang_scores:
-        best_lang = max(lang_scores, key=lang_scores.get)
-        if lang_scores[best_lang] >= 1:
-            return best_lang
+    best_lang = max(lang_scores, key=lang_scores.get)
+    best_score = lang_scores[best_lang]
 
-    return "English"
+    # If no stopwords matched, or if English tied/exceeded best non-English score, return English
+    if best_score == 0 or lang_scores["English"] >= best_score:
+        return "English"
+
+    return best_lang
 
 
 MULTILINGUAL_DOCUMENT_SYSTEM_PROMPT = """You are the official AI Customer Support Assistant for Zambia National Commercial Bank (Zanaco), answering questions strictly based on a document uploaded by the customer during this session.

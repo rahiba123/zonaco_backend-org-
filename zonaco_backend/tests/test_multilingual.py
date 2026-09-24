@@ -18,6 +18,7 @@ def test_language_detection():
     assert detect_language("¿Cuál es el contenido de este documento?") == "Spanish"
     assert detect_language("Was ist der Inhalt dieses Dokuments?") == "German"
     assert detect_language("What is the main topic of this document?") == "English"
+    assert detect_language("What does the Termination of Service facility allow an employer to do?") == "English"
 
 
 def test_embedding_capability_warning():
